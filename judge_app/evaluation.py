@@ -258,7 +258,7 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
                                          source_refs=refs[:1], chunk_refs=[chunk_ref], human_review=True))
     return {"configured": True, "provider": "openai_compatible_on_prem",
             "model": judge.model, "failed_chunk_calls": llm_errors,
-            "prompt_version": "chunk_judge_v1"}
+            "prompt_version": "chunk_judge_v2"}
 
 
 def _criterion_score(findings: list[dict[str, Any]]) -> dict[str, Any]:

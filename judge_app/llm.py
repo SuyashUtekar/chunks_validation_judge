@@ -54,12 +54,16 @@ class OpenAICompatibleJudge:
                 "JUDGE_LLM_ALLOW_REMOTE=true only for an approved internal endpoint."
             )
         self.endpoint = settings.llm_base_url.rstrip("/")
-        if not self.endpoint.endswith("/chat/completions"):
+        if self.endpoint.endswith("/chat/completions"):
+            pass
+        elif parsed.path.rstrip("/").endswith("/v1"):
             self.endpoint += "/chat/completions"
+        else:
+            self.endpoint += "/v1/chat/completions"
         self.model = settings.llm_model
 
     def judge(self, payload: dict[str, Any]) -> dict[str, Any]:
-        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "chunk_judge_v1.txt"
+        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "chunk_judge_v2.txt"
         system_prompt = prompt_path.read_text(encoding="utf-8")
         headers = {"Content-Type": "application/json"}
         if settings.llm_api_key:

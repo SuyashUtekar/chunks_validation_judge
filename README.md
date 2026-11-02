@@ -74,16 +74,15 @@ The initial criteria version is marked **proposed**. Suggested 95%/85% score ban
 
 ## Optional on-prem LLM
 
-No public model service is configured by default. Set an organization-approved OpenAI-compatible endpoint and model before starting the app:
+No public model service is configured by default. LiteLLM Proxy is supported through its OpenAI-compatible Chat Completions API. Configure the proxy base URL and a model alias enabled in LiteLLM before starting the app:
 
 ```sh
-export JUDGE_LLM_BASE_URL='http://127.0.0.1:8000/v1'
-export JUDGE_LLM_MODEL='approved-local-model'
-# Optional, only if the internal gateway requires it:
-export JUDGE_LLM_API_KEY='...'
+export JUDGE_LLM_BASE_URL='http://127.0.0.1:4000/v1'
+export JUDGE_LLM_MODEL='your-litellm-model-alias'
+export JUDGE_LLM_API_KEY='your-litellm-virtual-key'
 ```
 
-The evaluator sends compact chunk/source evidence, not the full PDF or full DOCX. Configure `JUDGE_LLM_ALLOW_REMOTE=true` only when the endpoint has been reviewed and approved as internal. The default host check permits loopback and private-network endpoints. LLM responses are schema-checked; malformed, unsupported, or ungrounded results become `INCONCLUSIVE` and require review.
+`JUDGE_LLM_BASE_URL` can be the proxy root (for example `http://127.0.0.1:4000`) or its `/v1` base URL; the app resolves either to the chat-completions route. `JUDGE_LLM_MODEL` must be the LiteLLM model alias available to that key. Set `JUDGE_LLM_JSON_MODE=false` if the selected LiteLLM model or deployment does not support JSON response mode. The evaluator sends compact chunk/source evidence, not the full PDF or full DOCX. The strict, versioned rubric is in `prompts/chunk_judge_v2.txt`; reports record the prompt version. Configure `JUDGE_LLM_ALLOW_REMOTE=true` only when the endpoint has been reviewed and approved as internal. The default host check permits loopback and private-network endpoints. LLM responses are schema-checked; malformed, unsupported, or ungrounded results become `INCONCLUSIVE` and require review.
 
 ## MVP boundaries
 
