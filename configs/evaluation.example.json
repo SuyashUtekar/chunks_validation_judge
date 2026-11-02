@@ -1,0 +1,11 @@
+{
+  "document_id": "sample-document",
+  "chunking_job_id": "sample-chunk-job",
+  "strategy": "sectionwise",
+  "max_words": 800,
+  "overlap_words": 80,
+  "required_metadata_fields": [],
+  "source_unit_coverage_pass_threshold": 95,
+  "pass_candidate_at": 95,
+  "review_required_below": 85
+}
