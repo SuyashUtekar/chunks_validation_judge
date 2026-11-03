@@ -6,7 +6,7 @@ This is the first deterministic MVP from the implementation plan. It performs ar
 
 ## Inputs
 
-- A PDFLens ZIP containing exactly one source PDF and optionally `document.docx` and `metadata.json`. If a `manifest.json` exists, listed hashes are checked.
+- A PDFLens ZIP containing `document.docx`, `metadata.json`, and any assets, plus the original source PDF. The PDF may be inside the ZIP or uploaded separately; if both are provided, their SHA-256 hashes must match. If a `manifest.json` exists, listed hashes are checked.
 - Chunk records as JSON, XLSX, or CSV. The current sectionwise chunking output is supported:
   - JSON object containing a `chunks` array with `chunk_id`, `text`, and `section_path`.
   - XLSX/CSV columns such as `chunk_id`, `chunk_text`.
@@ -22,7 +22,9 @@ Example config:
   "max_words": 800,
   "overlap_words": 80,
   "required_metadata_fields": [],
-  "source_unit_coverage_pass_threshold": 95
+  "source_unit_coverage_pass_threshold": 85,
+  "pass_candidate_at": 85,
+  "review_required_below": 65
 }
 ```
 
@@ -37,11 +39,12 @@ uv sync
 uv run uvicorn judge_app.main:app --reload --host 127.0.0.1 --port 8010
 ```
 
-Open `http://127.0.0.1:8010/docs` for the upload form. Or submit the PDFLens ZIP and generated chunks:
+Open `http://127.0.0.1:8010/docs` for the upload form. Or submit the PDFLens ZIP, original PDF (when it is not inside the ZIP), and generated chunks:
 
 ```sh
 curl -f -X POST http://127.0.0.1:8010/api/v1/chunk-evaluations \
   -F 'pdflens_package=@/path/to/pdflens-output.zip' \
+  -F 'source_pdf=@/path/to/original.pdf' \
   -F 'chunks_file=@/path/to/chunks.xlsx' \
   -F 'chunking_config={"strategy":"sectionwise","max_words":800,"overlap_words":80}'
 ```
@@ -50,7 +53,7 @@ The synchronous MVP responds with an evaluation ID and URLs for the JSON report 
 
 ## Streamlit interface
 
-The Streamlit interface takes the same PDFLens ZIP and a chunks JSON file, displays the summary and findings, and provides downloadable Excel and JSON reports. Start it from this folder:
+The Streamlit interface takes the PDFLens output ZIP, a chunks JSON file, and the original PDF separately when the ZIP does not contain it. It displays the summary and findings, and provides downloadable Excel and JSON reports. Start it from this folder:
 
 ```sh
 uv run streamlit run streamlit_app.py --server.address 127.0.0.1 --server.port 8501
@@ -70,7 +73,7 @@ The workbook has these sheets:
 - **Criteria** — the versioned baseline criteria and their aggregate outcomes.
 - **Input Audit** — input hashes, filenames, config, and extraction/model provenance.
 
-The initial criteria version is marked **proposed**. Suggested 95%/85% score bands are provisional plan values, not calibrated release thresholds. A critical failure overrides the score. `PASS` and `FAIL` alone contribute to percentages; `N/A` and `INCONCLUSIVE` are reported separately.
+The initial criteria version is marked **proposed**. The judge reports five primary dimensions: content coverage, content fidelity, section placement, chunk coherence/usefulness, and traceability. Each dimension is supported by cited detailed checks; the detailed checks are evidence, not separate top-level score points. The overall score is the average of dimensions with enough evidence to score. Current provisional defaults are 85% for a pass candidate and 65% for the review boundary; these are not calibrated release thresholds. Critical failures still override the score. `N/A` and `INCONCLUSIVE` are reported separately.
 
 ## Optional on-prem LLM
 
@@ -82,7 +85,7 @@ export JUDGE_LLM_MODEL='your-litellm-model-alias'
 export JUDGE_LLM_API_KEY='your-litellm-virtual-key'
 ```
 
-`JUDGE_LLM_BASE_URL` can be the proxy root (for example `http://127.0.0.1:4000`) or its `/v1` base URL; the app resolves either to the chat-completions route. `JUDGE_LLM_MODEL` must be the LiteLLM model alias available to that key. Set `JUDGE_LLM_JSON_MODE=false` if the selected LiteLLM model or deployment does not support JSON response mode. The evaluator sends compact chunk/source evidence, not the full PDF or full DOCX. The strict, versioned rubric is in `prompts/chunk_judge_v2.txt`; reports record the prompt version. Configure `JUDGE_LLM_ALLOW_REMOTE=true` only when the endpoint has been reviewed and approved as internal. The default host check permits loopback and private-network endpoints. LLM responses are schema-checked; malformed, unsupported, or ungrounded results become `INCONCLUSIVE` and require review.
+`JUDGE_LLM_BASE_URL` can be the proxy root (for example `http://127.0.0.1:4000`) or its `/v1` base URL; the app resolves either to the chat-completions route. `JUDGE_LLM_MODEL` must be the LiteLLM model alias available to that key. Set `JUDGE_LLM_JSON_MODE=false` if the selected LiteLLM model or deployment does not support JSON response mode. The evaluator sends compact chunk/source evidence, not the full PDF or full DOCX. The balanced, versioned rubric is in `prompts/chunk_judge_v4.txt`; it tolerates coherent adjacent subsections in one chunk while preserving strict checks for material content errors, and reports record the prompt version. It includes five concise calibration examples for related versus unrelated section grouping, upstream omissions, insufficient evidence, and a provable condition reversal. Configure `JUDGE_LLM_ALLOW_REMOTE=true` only when the endpoint has been reviewed and approved as internal. The default host check permits loopback and private-network endpoints. LLM responses are schema-checked; malformed, unsupported, or ungrounded results become `INCONCLUSIVE` and require review.
 
 ## MVP boundaries
 

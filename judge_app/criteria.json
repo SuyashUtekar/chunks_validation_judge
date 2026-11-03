@@ -1,5 +1,5 @@
 {
-  "criteria_version": "proposed-1.0-mvp",
+  "criteria_version": "proposed-2.0-mvp",
   "criteria": [
     {"id":"C01","category":"Content integrity","name":"Source content coverage","scope":"document","method":"deterministic"},
     {"id":"C02","category":"Content integrity","name":"Content accuracy","scope":"chunk","method":"llm"},

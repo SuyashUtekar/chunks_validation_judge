@@ -51,18 +51,23 @@ def health() -> dict[str, str]:
 async def create_evaluation(
     pdflens_package: UploadFile = File(...),
     chunks_file: UploadFile = File(...),
+    source_pdf: UploadFile | None = File(None),
     chunking_config: str = Form("{}"),
 ) -> JSONResponse:
     package_limit = settings.max_package_bytes + 1
     chunks_limit = settings.max_chunks_bytes + 1
     package_bytes = await pdflens_package.read(package_limit)
     chunks_bytes = await chunks_file.read(chunks_limit)
+    source_pdf_bytes = await source_pdf.read(settings.max_package_bytes + 1) if source_pdf else None
     if len(package_bytes) >= package_limit:
         raise HTTPException(413, detail={"code": "PACKAGE_TOO_LARGE", "message": "PDFLens package exceeds the configured limit."})
     if len(chunks_bytes) >= chunks_limit:
         raise HTTPException(413, detail={"code": "CHUNKS_TOO_LARGE", "message": "Chunk input exceeds the configured limit."})
+    if source_pdf_bytes is not None and len(source_pdf_bytes) > settings.max_package_bytes:
+        raise HTTPException(413, detail={"code": "SOURCE_PDF_TOO_LARGE", "message": "Source PDF exceeds the configured limit."})
     try:
-        package = load_pdflens_package(package_bytes)
+        package = load_pdflens_package(package_bytes, source_pdf_bytes,
+                                       Path(source_pdf.filename or "source.pdf").name if source_pdf else None)
         chunks = normalize_chunks(chunks_bytes, chunks_file.filename or "chunks.json")
         config = parse_config(chunking_config)
     except InputValidationError as exc:

@@ -37,7 +37,8 @@ def _safe_zip_name(name: str) -> bool:
     return not path.is_absolute() and ".." not in path.parts and "\\" not in name
 
 
-def load_pdflens_package(raw: bytes) -> InputBundle:
+def load_pdflens_package(raw: bytes, source_pdf_bytes: bytes | None = None,
+                        source_pdf_name: str | None = None) -> InputBundle:
     if len(raw) > settings.max_package_bytes:
         raise InputValidationError("PDFLens package exceeds the configured size limit.")
     if not zipfile.is_zipfile(io.BytesIO(raw)):
@@ -60,14 +61,21 @@ def load_pdflens_package(raw: bytes) -> InputBundle:
         pdf_names = [name for name in files if name.casefold().endswith(".pdf")]
         docx_names = [name for name in files if name.casefold().endswith(".docx")]
         metadata_names = [name for name in files if PurePosixPath(name).name.casefold() == "metadata.json"]
-        if len(pdf_names) != 1:
-            raise InputValidationError("Package must contain exactly one source PDF.")
+        if len(pdf_names) > 1:
+            raise InputValidationError("Package must contain at most one source PDF.")
         if len(docx_names) > 1:
             raise InputValidationError("Package must contain at most one DOCX.")
-        pdf_name = pdf_names[0]
-        pdf_bytes = archive.read(pdf_name)
+        embedded_pdf = archive.read(pdf_names[0]) if pdf_names else None
+        if embedded_pdf and source_pdf_bytes and sha256(embedded_pdf) != sha256(source_pdf_bytes):
+            raise InputValidationError("The separately uploaded source PDF does not match the PDF inside the ZIP.")
+        pdf_bytes = embedded_pdf or source_pdf_bytes
+        pdf_name = pdf_names[0] if pdf_names else (source_pdf_name or "source.pdf")
+        if pdf_bytes is None:
+            raise InputValidationError(
+                "The ZIP has no source PDF. Upload the original PDF separately to run evidence-based validation."
+            )
         if not pdf_bytes.startswith(b"%PDF-"):
-            raise InputValidationError("The package PDF does not have a valid PDF signature.")
+            raise InputValidationError("The source PDF does not have a valid PDF signature.")
         docx_name = docx_names[0] if docx_names else None
         docx_bytes = archive.read(docx_name) if docx_name else None
         metadata = None
@@ -78,13 +86,15 @@ def load_pdflens_package(raw: bytes) -> InputBundle:
                 metadata = json.loads(archive.read(metadata_names[0]))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise InputValidationError("Package metadata.json is not valid JSON.") from exc
-        _validate_manifest(archive, files)
+        _validate_manifest(archive, files, source_pdf_bytes, source_pdf_name)
         return InputBundle(pdf_bytes, docx_bytes, metadata, names, pdf_name, docx_name, sha256(raw))
     except zipfile.BadZipFile as exc:
         raise InputValidationError("PDFLens package is not a readable ZIP file.") from exc
 
 
-def _validate_manifest(archive: zipfile.ZipFile, files: dict[str, zipfile.ZipInfo]) -> None:
+def _validate_manifest(archive: zipfile.ZipFile, files: dict[str, zipfile.ZipInfo],
+                       external_pdf_bytes: bytes | None = None,
+                       external_pdf_name: str | None = None) -> None:
     manifest_names = [name for name in files if PurePosixPath(name).name.casefold() == "manifest.json"]
     if not manifest_names:
         return
@@ -100,9 +110,16 @@ def _validate_manifest(archive: zipfile.ZipFile, files: dict[str, zipfile.ZipInf
             raise InputValidationError("Package manifest has an invalid member entry.")
         name = member.get("path")
         expected = member.get("sha256")
-        if not isinstance(name, str) or name not in files or not _safe_zip_name(name):
+        if not isinstance(name, str) or not _safe_zip_name(name):
             raise InputValidationError("Package manifest references a missing or unsafe member.")
-        actual = sha256(archive.read(name))
+        if name in files:
+            actual = sha256(archive.read(name))
+        elif (external_pdf_bytes is not None and external_pdf_name
+              and name.casefold().endswith(".pdf")
+              and PurePosixPath(name).name.casefold() == PurePosixPath(external_pdf_name).name.casefold()):
+            actual = sha256(external_pdf_bytes)
+        else:
+            raise InputValidationError("Package manifest references a missing or unsafe member.")
         if expected and actual.casefold() != str(expected).casefold():
             raise InputValidationError(f"Package checksum mismatch for {name}.")
 

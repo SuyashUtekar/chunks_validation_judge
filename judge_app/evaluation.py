@@ -11,6 +11,8 @@ from typing import Any
 import uuid
 
 from . import __version__
+from .action_plan import build_action_plan
+from .scorecard import build_scorecard, core_critical_failure
 from .evidence import build_source_evidence
 from .ingestion import InputBundle
 from .llm import LLMUnavailableError, OpenAICompatibleJudge
@@ -258,7 +260,7 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
                                          source_refs=refs[:1], chunk_refs=[chunk_ref], human_review=True))
     return {"configured": True, "provider": "openai_compatible_on_prem",
             "model": judge.model, "failed_chunk_calls": llm_errors,
-            "prompt_version": "chunk_judge_v2"}
+            "prompt_version": "chunk_judge_v4"}
 
 
 def _criterion_score(findings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -273,15 +275,15 @@ def _criterion_score(findings: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _chunk_gate(findings: list[dict[str, Any]], thresholds: dict[str, Any]) -> str:
-    counts = _criterion_score(findings)
-    if any(item.get("severity") == "CRITICAL" for item in findings if item["outcome"] == "FAIL"):
+    scorecard = build_scorecard(findings, include_document=False)
+    if core_critical_failure(findings):
         return "FAIL"
-    if counts["scorable_count"] == 0:
-        return "NOT_EVALUATED"
-    score = counts["pass_percentage"]
+    if not scorecard["scored_dimensions"]:
+        return "REVIEW_REQUIRED" if scorecard["inconclusive_count"] else "NOT_EVALUATED"
+    score = scorecard["overall_score"]
     if score < float(thresholds["review_required_below"]):
         return "FAIL"
-    if score < float(thresholds["pass_candidate_at"]) or counts["inconclusive_count"]:
+    if score < float(thresholds["pass_candidate_at"]) or scorecard["inconclusive_count"]:
         return "REVIEW_REQUIRED"
     return "PASS"
 
@@ -583,7 +585,7 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
                                  source_refs=[], chunk_refs=["chunkset:all"], human_review=True, scope="document"))
     else:
         source_refs = [unit["unit_id"] for unit in eligible_units[:20]]
-        if coverage_pct >= float(config.get("source_unit_coverage_pass_threshold", 95)):
+        if coverage_pct >= float(config.get("source_unit_coverage_pass_threshold", 85)):
             c01 = "PASS"
         elif coverage_pct < 60:
             c01 = "FAIL"
@@ -628,8 +630,14 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
     source_section_paths = {tuple(item["section_path"]) for item in sections if item.get("section_path")}
     covered_section_paths = set()
     for path in source_section_paths:
-        if any(chunk["section_path"] and tuple(chunk["section_path"][:len(path)]) == path
-               for chunk in chunks):
+        if any(
+            chunk["section_path"]
+            and (
+                tuple(chunk["section_path"][:len(path)]) == path
+                or tuple(path[:len(chunk["section_path"])]) == tuple(chunk["section_path"])
+            )
+            for chunk in chunks
+        ):
             covered_section_paths.add(path)
     if not source_section_paths:
         s05 = "INCONCLUSIVE"
@@ -655,6 +663,7 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
     for chunk in chunks:
         chunk_findings = [item for item in findings if item["chunk_id"] == chunk["chunk_id"]]
         score = _criterion_score(chunk_findings)
+        chunk_scorecard = build_scorecard(chunk_findings, include_document=False)
         chunk_reports.append({
             "chunk_id": chunk["chunk_id"], "sequence_number": chunk["sequence_number"] or chunk["row_number"],
             "section_id": chunk["section_id"], "section_path": chunk["section_path"],
@@ -662,9 +671,11 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
             "character_count": len(chunk["content"]), "alignment_confidence": chunk["alignment_confidence"],
             "aligned_source_refs": chunk["aligned_source_refs"], "aligned_pages": chunk["aligned_pages"],
             "unsupported_token_ratio": chunk.get("unsupported_token_ratio"), **score,
+            "overall_score": chunk_scorecard["overall_score"],
+            "scored_dimensions": chunk_scorecard["scored_dimensions"],
             "quality_gate": _chunk_gate(chunk_findings, {
-                "pass_candidate_at": config.get("pass_candidate_at", 95),
-                "review_required_below": config.get("review_required_below", 85),
+                "pass_candidate_at": config.get("pass_candidate_at", 85),
+                "review_required_below": config.get("review_required_below", 65),
             }),
             "chunk_excerpt": _truncate(chunk["content"]),
         })
@@ -672,7 +683,10 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
     section_reports = []
     for path in sorted(source_section_paths, key=lambda item: (len(item), item)):
         section_chunks = [item for item in chunk_reports
-                          if tuple(item["section_path"][:len(path)]) == path]
+                          if item["section_path"] and (
+                              tuple(item["section_path"][:len(path)]) == path
+                              or tuple(path[:len(item["section_path"])]) == tuple(item["section_path"])
+                          )]
         section_findings = [finding for finding in findings
                             if finding["chunk_id"] in {item["chunk_id"] for item in section_chunks}]
         section_score = _criterion_score(section_findings)
@@ -687,17 +701,21 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
         })
 
     total_score = _criterion_score(findings)
-    pass_pct = total_score["pass_percentage"]
-    thresholds = {"pass_candidate_at": float(config.get("pass_candidate_at", 95)),
-                  "review_required_below": float(config.get("review_required_below", 85))}
+    scorecard = build_scorecard(findings)
+    pass_pct = scorecard["overall_score"]
+    thresholds = {"pass_candidate_at": float(config.get("pass_candidate_at", 85)),
+                  "review_required_below": float(config.get("review_required_below", 65))}
     chunk_fail_count = sum(item["fail_count"] > 0 for item in chunk_reports)
-    critical = sum(item["severity"] == "CRITICAL" for item in findings if item["outcome"] == "FAIL")
+    critical = sum(item["severity"] == "CRITICAL" for item in findings
+                   if item["outcome"] == "FAIL" and item["criterion_id"] in {
+                       "C01", "C03", "C02", "C05", "C06", "S01", "S02", "S03", "S04", "S05",
+                       "M01", "M02", "M03", "M05", "B01", "B03", "T01", "T03"})
     high = sum(item["severity"] == "HIGH" for item in findings if item["outcome"] == "FAIL")
-    if not total_score["scorable_count"]:
-        gate = "NOT_EVALUATED"
+    if not scorecard["scored_dimensions"]:
+        gate = "REVIEW_REQUIRED" if scorecard["inconclusive_count"] else "NOT_EVALUATED"
     elif critical or (pass_pct is not None and pass_pct < thresholds["review_required_below"]):
         gate = "FAIL"
-    elif pass_pct is None or pass_pct < thresholds["pass_candidate_at"] or total_score["inconclusive_count"]:
+    elif pass_pct is None or pass_pct < thresholds["pass_candidate_at"] or scorecard["inconclusive_count"]:
         gate = "REVIEW_REQUIRED"
     else:
         gate = "PASS"
@@ -715,8 +733,11 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
         "inconclusive_count": total_score["inconclusive_count"],
         "not_applicable_count": total_score["not_applicable_count"],
         "scorable_criteria": total_score["scorable_count"],
-        "pass_percentage": pass_pct, "signed_score": total_score["signed_score"],
-        "raw_score": total_score["raw_score"], "critical_failures": critical,
+        "pass_percentage": total_score["pass_percentage"], "signed_score": total_score["signed_score"],
+        "raw_score": total_score["raw_score"], "overall_score": pass_pct,
+        "scored_dimensions": scorecard["scored_dimensions"],
+        "core_failures": scorecard["fail_count"],
+        "core_inconclusive": scorecard["inconclusive_count"], "critical_failures": critical,
         "high_failures": high, "source_coverage_percentage": round(coverage_pct, 2) if coverage_pct is not None else None,
         "eligible_source_units": len(eligible_units), "covered_source_units": covered_count,
         "missing_source_units": len(missing_units), "pdf_docx_discrepancies": len(upstream_issues),
@@ -738,6 +759,8 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
         "judge_application_version": __version__,
         "source_kind_for_alignment": source_kind,
         "summary": summary,
+        "scorecard": scorecard,
+        "action_plan": build_action_plan(gate, findings, missing_units, upstream_issues),
         "coverage": {
             "source_coverage_percentage": summary["source_coverage_percentage"],
             "eligible_source_units": len(eligible_units), "covered_source_units": covered_count,

@@ -63,7 +63,7 @@ class OpenAICompatibleJudge:
         self.model = settings.llm_model
 
     def judge(self, payload: dict[str, Any]) -> dict[str, Any]:
-        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "chunk_judge_v2.txt"
+        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "chunk_judge_v4.txt"
         system_prompt = prompt_path.read_text(encoding="utf-8")
         headers = {"Content-Type": "application/json"}
         if settings.llm_api_key:

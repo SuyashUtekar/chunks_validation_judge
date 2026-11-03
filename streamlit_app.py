@@ -41,13 +41,17 @@ with st.sidebar:
         "Without it, those checks are marked INCONCLUSIVE."
     )
 
-package_upload = st.file_uploader("PDFLens output package", type=["zip"], key="package_zip")
+package_upload = st.file_uploader("PDFLens output ZIP", type=["zip"], key="package_zip",
+                                 help="The ZIP may contain document.docx, metadata.json, and assets. If it does not contain the original PDF, upload that PDF below.")
+source_pdf_upload = st.file_uploader("Original source PDF (if not inside ZIP)", type=["pdf"], key="source_pdf")
 chunks_upload = st.file_uploader("Section-wise chunks JSON", type=["json"], key="chunks_json")
 
 if package_upload:
     st.caption(f"PDFLens package: {package_upload.name} · {package_upload.size / (1024 * 1024):.1f} MiB")
 if chunks_upload:
     st.caption(f"Chunks: {chunks_upload.name} · {chunks_upload.size / 1024:.1f} KiB")
+if source_pdf_upload:
+    st.caption(f"Source PDF: {source_pdf_upload.name} · {source_pdf_upload.size / (1024 * 1024):.1f} MiB")
 
 run_evaluation = st.button(
     "Evaluate chunks",
@@ -62,7 +66,11 @@ if run_evaluation:
     try:
         package_bytes = package_upload.getvalue()
         chunks_bytes = chunks_upload.getvalue()
-        package = load_pdflens_package(package_bytes)
+        package = load_pdflens_package(
+            package_bytes,
+            source_pdf_upload.getvalue() if source_pdf_upload else None,
+            source_pdf_upload.name if source_pdf_upload else None,
+        )
         chunks = normalize_chunks(chunks_bytes, chunks_upload.name)
         config = parse_config(config_text)
         with st.spinner(f"Evaluating {len(chunks)} chunks against the PDFLens source…"):
@@ -92,12 +100,13 @@ if report:
         st.error(f"Quality gate: {gate}")
     else:
         st.warning(f"Quality gate: {gate}")
+    st.info(report.get("action_plan", {}).get("summary", "Review the findings and evidence below."))
 
     columns = st.columns(5)
     columns[0].metric("Chunks", summary["total_chunks"])
-    columns[1].metric("Pass rate", f"{summary['pass_percentage']:.2f}%" if summary["pass_percentage"] is not None else "—")
-    columns[2].metric("Failures", summary["fail_count"])
-    columns[3].metric("Inconclusive", summary["inconclusive_count"])
+    columns[1].metric("Overall score", f"{summary['overall_score']:.2f}%" if summary.get("overall_score") is not None else "—")
+    columns[2].metric("Scored failures", summary.get("core_failures", 0))
+    columns[3].metric("Unresolved scored checks", summary.get("core_inconclusive", 0))
     columns[4].metric(
         "DOCX source coverage",
         f"{summary['source_coverage_percentage']:.2f}%"
@@ -129,7 +138,48 @@ if report:
         use_container_width=True,
     )
 
-    tabs = st.tabs(["Chunks", "Findings", "Sections", "Coverage"])
+    st.subheader("Five-point scorecard")
+    st.caption("The overall score is the average of the scored dimensions below. Detailed checks remain available as evidence and are not each counted as separate top-level points.")
+    scorecard = report.get("scorecard", {})
+    if scorecard.get("dimensions"):
+        st.dataframe([
+            {"Dimension": item["dimension"], "Score": f"{item['pass_percentage']:.1f}%" if item["pass_percentage"] is not None else "Not scored",
+             "Result": item["status"], "What it checks": item["what_it_checks"]}
+            for item in scorecard["dimensions"]
+        ], use_container_width=True, hide_index=True)
+    else:
+        st.write("No scorecard dimensions had enough evidence to score.")
+
+    st.subheader("What to do next")
+    action_items = report.get("action_plan", {}).get("actions", [])
+    if action_items:
+        for index, action in enumerate(action_items, start=1):
+            st.markdown(f"**{index}. {action['priority']} priority — {action['title']}**")
+            st.write(action["what_to_do"])
+            details = []
+            if action.get("chunk_ids"):
+                details.append("Chunks: " + ", ".join(action["chunk_ids"][:12]))
+            if action.get("criterion_ids"):
+                details.append("Checks: " + ", ".join(action["criterion_ids"]))
+            if action.get("source_refs"):
+                details.append("Source refs: " + ", ".join(action["source_refs"][:8]))
+            if action.get("pages"):
+                details.append("Pages: " + ", ".join(str(page) for page in action["pages"]))
+            if details:
+                st.caption(" · ".join(details))
+    else:
+        st.write("No corrective actions were identified from the available evidence.")
+
+    with st.expander("How to read these results"):
+        st.markdown(
+            "- **PASS:** met the current provisional thresholds.\n"
+            "- **REVIEW_REQUIRED:** inspect the listed failures and unresolved checks.\n"
+            "- **FAIL:** fix critical findings or results below the configured review boundary.\n"
+            "- **INCONCLUSIVE:** evidence was insufficient; this does not by itself mean the chunk is wrong.\n"
+            "- If PDF text is missing from the DOCX, investigate PDFLens conversion before changing chunking."
+        )
+
+    tabs = st.tabs(["Chunks", "Findings & evidence", "Sections", "Coverage"])
     with tabs[0]:
         st.dataframe(report["chunks"], use_container_width=True, hide_index=True)
     with tabs[1]:
