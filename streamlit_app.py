@@ -123,7 +123,7 @@ if report:
     package_filename = report["inputs"].get("pdflens_package_filename", "document.zip")
     report_stem = Path(report.get("document_id") or Path(package_filename).stem).stem
     download_columns[0].download_button(
-        "Download Excel report",
+        "Download concise Excel report",
         data=st.session_state["judge_xlsx"],
         file_name=f"{report_stem}_chunk_quality_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -131,13 +131,14 @@ if report:
         use_container_width=True,
     )
     download_columns[1].download_button(
-        "Download JSON report",
+        "Download concise JSON report",
         data=st.session_state["judge_json"],
         file_name=f"{report_stem}_chunk_quality_report.json",
         mime="application/json",
         use_container_width=True,
     )
 
+    st.caption("Downloads contain a compact overview, five-point scorecard, next steps, and up to 40 evidence rows. The detailed findings remain available in the app below.")
     st.subheader("Five-point scorecard")
     st.caption("The overall score is the average of the scored dimensions below. Detailed checks remain available as evidence and are not each counted as separate top-level points.")
     scorecard = report.get("scorecard", {})

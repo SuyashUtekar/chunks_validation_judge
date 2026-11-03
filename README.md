@@ -63,15 +63,7 @@ Or run `make run-ui`. Open `http://127.0.0.1:8501`. The optional configuration J
 
 ## Reports
 
-The workbook has these sheets:
-
-- **Summary** — quality gate, pooled scores, coverage, upstream discrepancy counts, and model state.
-- **Chunk Results** — per-chunk alignment, criteria counts, score, and gate.
-- **Findings** — criterion outcome, severity, explanation, evidence IDs, short evidence excerpts, and review flag.
-- **Sections** — section coverage and aggregate scores.
-- **Coverage** — source units missing from chunks and PDF-to-DOCX upstream discrepancies.
-- **Criteria** — the versioned baseline criteria and their aggregate outcomes.
-- **Input Audit** — input hashes, filenames, config, and extraction/model provenance.
+Downloads are intentionally concise. The JSON report contains the decision, source/chunk summary, five-point scorecard, grouped next steps, and up to 40 evidence-backed FAIL/INCONCLUSIVE rows. The Excel workbook has four sheets: **Overview**, **Scorecard**, **Next Steps**, and **Evidence to Review**. Longer diagnostics remain in the live app; they are not duplicated into the default downloads.
 
 The initial criteria version is marked **proposed**. The judge reports five primary dimensions: content coverage, content fidelity, section placement, chunk coherence/usefulness, and traceability. Each dimension is supported by cited detailed checks; the detailed checks are evidence, not separate top-level score points. The overall score is the average of dimensions with enough evidence to score. Current provisional defaults are 85% for a pass candidate and 65% for the review boundary; these are not calibrated release thresholds. Critical failures still override the score. `N/A` and `INCONCLUSIVE` are reported separately.
 

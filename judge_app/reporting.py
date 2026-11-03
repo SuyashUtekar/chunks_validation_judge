@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 _HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 _SUBHEADER_FILL = PatternFill("solid", fgColor="D9EAF7")
 _OUTCOME_FILLS = {
-    "PASS": PatternFill("solid", fgColor="E2F0D9"),
     "FAIL": PatternFill("solid", fgColor="FCE4D6"),
     "INCONCLUSIVE": PatternFill("solid", fgColor="FFF2CC"),
-    "N/A": PatternFill("solid", fgColor="E7E6E6"),
 }
+_MAX_EVIDENCE_ROWS = 40
+_MAX_REFERENCES = 8
+_MAX_EXCERPT_CHARS = 220
 
 
 def _excel_safe(value: Any) -> Any:
@@ -28,245 +29,220 @@ def _excel_safe(value: Any) -> Any:
     return value
 
 
-def _append_table(sheet: Any, headers: list[str], rows: list[list[Any]]) -> None:
-    sheet.append(headers)
-    for cell in sheet[1]:
+def _short(value: Any, limit: int = _MAX_EXCERPT_CHARS) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _primary_criterion_ids(report: dict[str, Any]) -> set[str]:
+    return {
+        criterion_id
+        for dimension in report.get("scorecard", {}).get("dimensions", [])
+        for criterion_id in dimension.get("criteria", [])
+    }
+
+
+def _evidence_to_review(report: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    primary_ids = _primary_criterion_ids(report)
+    rows = [
+        item for item in report.get("findings", [])
+        if item.get("criterion_id") in primary_ids
+        and item.get("outcome") in {"FAIL", "INCONCLUSIVE"}
+    ]
+    severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, None: 4}
+    rows.sort(key=lambda item: (
+        0 if item.get("outcome") == "FAIL" else 1,
+        severity_rank.get(item.get("severity"), 4),
+        item.get("chunk_id") or "",
+        item.get("criterion_id") or "",
+    ))
+    compact = []
+    for item in rows[:_MAX_EVIDENCE_ROWS]:
+        compact.append({
+            "chunk_id": item.get("chunk_id") or None,
+            "criterion": item.get("criterion"),
+            "outcome": item.get("outcome"),
+            "severity": item.get("severity"),
+            "explanation": _short(item.get("explanation")),
+            "source_refs": (item.get("source_evidence_refs") or [])[:_MAX_REFERENCES],
+            "chunk_refs": (item.get("chunk_evidence_refs") or [])[:_MAX_REFERENCES],
+            "source_excerpt": _short(item.get("source_excerpt")),
+            "chunk_excerpt": _short(item.get("chunk_excerpt")),
+        })
+    return compact, max(0, len(rows) - len(compact))
+
+
+def _compact_actions(report: dict[str, Any]) -> list[dict[str, Any]]:
+    actions = []
+    for item in report.get("action_plan", {}).get("actions", [])[:10]:
+        chunks = item.get("chunk_ids") or []
+        sources = item.get("source_refs") or []
+        actions.append({
+            "priority": item.get("priority"),
+            "issue": item.get("title"),
+            "next_step": _short(item.get("what_to_do"), 320),
+            "affected_chunk_count": len(chunks),
+            "chunk_ids": chunks[:_MAX_REFERENCES],
+            "source_refs": sources[:_MAX_REFERENCES],
+            "pages": (item.get("pages") or [])[:_MAX_REFERENCES],
+            "criteria": (item.get("criterion_ids") or [])[:_MAX_REFERENCES],
+        })
+    return actions
+
+
+def compact_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Return a concise, evidence-backed report for normal download/API use."""
+    summary = report.get("summary", {})
+    metadata = report.get("chunk_file_metadata", {})
+    evidence, omitted = _evidence_to_review(report)
+    source_docx = metadata.get("source_docx") or report.get("inputs", {}).get("source_docx_member")
+    input_docx = report.get("inputs", {}).get("source_docx_member")
+    scorecard = [
+        {
+            "dimension": item.get("dimension"),
+            "score_percent": item.get("pass_percentage"),
+            "result": item.get("status"),
+            "what_it_checks": item.get("what_it_checks"),
+            "scorable_checks": item.get("scorable_count"),
+            "failed_checks": item.get("fail_count"),
+            "unresolved_checks": item.get("inconclusive_count"),
+        }
+        for item in report.get("scorecard", {}).get("dimensions", [])
+    ]
+    return {
+        "report_version": "concise-1",
+        "evaluation_id": report.get("evaluation_id"),
+        "created_at": report.get("created_at"),
+        "quality_gate": report.get("quality_gate"),
+        "what_this_means": report.get("action_plan", {}).get("summary"),
+        "document": {
+            "title": metadata.get("document_title") or report.get("document_id"),
+            "source_docx": Path(str(source_docx)).name if source_docx else input_docx,
+            "chunk_file": report.get("inputs", {}).get("chunks_filename"),
+            "chunk_count": summary.get("total_chunks"),
+            "strategy": report.get("chunking_strategy"),
+            "max_words": metadata.get("max_words"),
+            "overlap_words": metadata.get("overlap_words"),
+        },
+        "overall_score_percent": summary.get("overall_score"),
+        "scorecard": scorecard,
+        "coverage": {
+            "docx_source_coverage_percent": summary.get("source_coverage_percentage"),
+            "covered_source_units": summary.get("covered_source_units"),
+            "eligible_source_units": summary.get("eligible_source_units"),
+            "docx_units_not_in_chunks": summary.get("missing_source_units"),
+            "possible_pdf_to_docx_omissions": summary.get("pdf_docx_discrepancies"),
+        },
+        "next_steps": _compact_actions(report),
+        "evidence_to_review": evidence,
+        "evidence_rows_omitted": omitted,
+        "judge": {
+            "criteria_version": report.get("criteria_version"),
+            "prompt_version": report.get("llm", {}).get("prompt_version"),
+            "model": report.get("llm", {}).get("model"),
+        },
+    }
+
+
+def _style_header(sheet: Any, row_number: int = 1) -> None:
+    for cell in sheet[row_number]:
         cell.fill = _HEADER_FILL
         cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
         cell.alignment = Alignment(vertical="center", wrap_text=True)
-    for row in rows:
-        sheet.append([_excel_safe(value) for value in row])
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions if rows else f"A1:{get_column_letter(len(headers))}1"
-    sheet.row_dimensions[1].height = 30
-    for row in sheet.iter_rows(min_row=2):
+    sheet.row_dimensions[row_number].height = 30
+
+
+def _style_body(sheet: Any, min_row: int = 2) -> None:
+    for row in sheet.iter_rows(min_row=min_row):
         for cell in row:
             cell.font = Font(name="Arial", size=10)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-    for column in range(1, len(headers) + 1):
-        width = min(60, max(14, max((len(str(sheet.cell(row=row, column=column).value or ""))
-                                    for row in range(1, min(sheet.max_row, 50) + 1)), default=14) + 2))
-        sheet.column_dimensions[get_column_letter(column)].width = width
 
 
 def build_report_xlsx(report: dict[str, Any]) -> bytes:
+    """Build a small workbook with an overview, five scores, actions, and limited evidence."""
+    compact = compact_report(report)
     workbook = Workbook()
-    summary_sheet = workbook.active
-    summary_sheet.title = "Summary"
-    summary = report["summary"]
-    top_rows = [
-        ["Evaluation ID", report["evaluation_id"]],
-        ["Status", report["status"]],
-        ["Quality gate", report["quality_gate"]],
-        ["What this means", report.get("action_plan", {}).get("summary")],
-        ["Overall score (average of scored dimensions)", summary.get("overall_score")],
-        ["Scored dimensions", summary.get("scored_dimensions")],
-        ["Primary scorecard failures", summary.get("core_failures")],
-        ["Primary scorecard unresolved checks", summary.get("core_inconclusive")],
-        ["Critical failures", summary["critical_failures"]],
-        ["Total chunks", summary["total_chunks"]],
-        ["Chunks failing scorecard", summary["chunks_failed"]],
-        ["Chunks requiring review", summary["chunks_with_review_required"]],
-        ["DOCX source coverage %", summary["source_coverage_percentage"]],
-        ["Covered / eligible DOCX source units", f"{summary['covered_source_units']} / {summary['eligible_source_units']}"],
-        ["PDF-to-DOCX discrepancies to review", summary["pdf_docx_discrepancies"]],
-        ["Pass candidate threshold", report["quality_gate_thresholds"]["pass_candidate_at"]],
-        ["Review boundary", report["quality_gate_thresholds"]["review_required_below"]],
-        ["LLM configured", report["llm"]["configured"]],
-        ["LLM model", report["llm"].get("model")],
-        ["Document ID", report.get("document_id")],
-        ["Chunking job ID", report.get("chunking_job_id")],
-        ["Chunking strategy", report.get("chunking_strategy")],
-        ["Criteria version", report["criteria_version"]],
-        ["Application version", report["judge_application_version"]],
-        ["Created at (UTC)", report["created_at"]],
+
+    overview = workbook.active
+    overview.title = "Overview"
+    overview.append(["Result", "Details"])
+    _style_header(overview)
+    values = [
+        ("Decision", compact["quality_gate"]),
+        ("What this means", compact["what_this_means"]),
+        ("Overall score", compact["overall_score_percent"]),
+        ("Document", compact["document"]["title"]),
+        ("Source DOCX", compact["document"]["source_docx"]),
+        ("Chunk count", compact["document"]["chunk_count"]),
+        ("Chunking strategy", compact["document"]["strategy"]),
+        ("DOCX source coverage", compact["coverage"]["docx_source_coverage_percent"]),
+        ("DOCX source units missing from chunks", compact["coverage"]["docx_units_not_in_chunks"]),
+        ("Possible PDF-to-DOCX omissions", compact["coverage"]["possible_pdf_to_docx_omissions"]),
+        ("Next steps", len(compact["next_steps"])),
+        ("Evidence rows included", len(compact["evidence_to_review"])),
+        ("Additional evidence rows omitted", compact["evidence_rows_omitted"]),
+        ("Evaluation ID", compact["evaluation_id"]),
     ]
-    summary_sheet.append(["Field", "Value"])
-    for cell in summary_sheet[1]:
-        cell.fill = _HEADER_FILL
-        cell.font = Font(bold=True, color="FFFFFF")
-    for row in top_rows:
-        summary_sheet.append([_excel_safe(value) for value in row])
-    summary_sheet.column_dimensions["A"].width = 38
-    summary_sheet.column_dimensions["B"].width = 80
-    for row in summary_sheet.iter_rows(min_row=2):
-        row[0].font = Font(bold=True)
+    for key, value in values:
+        overview.append([key, _excel_safe(value)])
+    overview.column_dimensions["A"].width = 38
+    overview.column_dimensions["B"].width = 88
+    _style_body(overview)
+    for row in overview.iter_rows(min_row=2):
         row[0].fill = _SUBHEADER_FILL
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        row[0].font = Font(bold=True)
 
-    action_sheet = workbook.create_sheet("Action Plan", 1)
-    action_plan = report.get("action_plan", {})
-    action_sheet.append(["Overall interpretation", action_plan.get("summary", "No action summary available.")])
-    action_sheet.merge_cells(start_row=1, start_column=2, end_row=1, end_column=8)
-    action_sheet["A1"].fill = _SUBHEADER_FILL
-    action_sheet["A1"].font = Font(bold=True)
-    action_sheet["A1"].alignment = Alignment(vertical="top", wrap_text=True)
-    action_sheet["B1"].alignment = Alignment(vertical="top", wrap_text=True)
-    action_sheet.append([])
-    action_headers = ["Priority", "Issue to review", "What to do", "Criteria", "Affected chunks", "Source refs", "Pages", "Finding IDs"]
-    action_sheet.append(action_headers)
-    for cell in action_sheet[3]:
-        cell.fill = _HEADER_FILL
-        cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-        cell.alignment = Alignment(vertical="center", wrap_text=True)
-    for item in action_plan.get("actions", []):
-        action_sheet.append([_excel_safe(item.get("priority")), _excel_safe(item.get("title")),
-                             _excel_safe(item.get("what_to_do")), _excel_safe(item.get("criterion_ids")),
-                             _excel_safe(item.get("chunk_ids")), _excel_safe(item.get("source_refs")),
-                             _excel_safe(item.get("pages")), _excel_safe(item.get("finding_ids"))])
-    if not action_plan.get("actions"):
-        action_sheet.append(["", "No corrective actions were identified."])
-    action_sheet.freeze_panes = "A4"
-    action_sheet.auto_filter.ref = action_sheet.dimensions
-    action_sheet.column_dimensions["A"].width = 14
-    action_sheet.column_dimensions["B"].width = 36
-    action_sheet.column_dimensions["C"].width = 90
-    action_sheet.column_dimensions["D"].width = 18
-    action_sheet.column_dimensions["E"].width = 36
-    action_sheet.column_dimensions["F"].width = 34
-    action_sheet.column_dimensions["G"].width = 18
-    action_sheet.column_dimensions["H"].width = 28
-    for row in action_sheet.iter_rows(min_row=4):
-        for cell in row:
-            cell.font = Font(name="Arial", size=10)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    score_sheet = workbook.create_sheet("Scorecard")
+    score_sheet.append(["Dimension", "Score %", "Result", "What this checks", "Failed", "Unresolved"])
+    _style_header(score_sheet)
+    for item in compact["scorecard"]:
+        score_sheet.append([_excel_safe(item["dimension"]), item["score_percent"],
+                            _excel_safe(item["result"]), _excel_safe(item["what_it_checks"]),
+                            item["failed_checks"], item["unresolved_checks"]])
+    score_sheet.freeze_panes = "A2"
+    score_sheet.auto_filter.ref = score_sheet.dimensions
+    for col, width in {"A": 32, "B": 14, "C": 18, "D": 76, "E": 12, "F": 14}.items():
+        score_sheet.column_dimensions[col].width = width
+    _style_body(score_sheet)
 
-    scorecard_sheet = workbook.create_sheet("Scorecard", 1)
-    scorecard = report.get("scorecard", {})
-    scorecard_sheet.append(["Overall score", scorecard.get("overall_score")])
-    scorecard_sheet.append(["Scored dimensions", scorecard.get("scored_dimensions")])
-    scorecard_sheet.append([])
-    scorecard_headers = ["Dimension", "Score", "Result", "What this checks", "Supporting criterion IDs"]
-    scorecard_sheet.append(scorecard_headers)
-    for cell in scorecard_sheet[4]:
-        cell.fill = _HEADER_FILL
-        cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-        cell.alignment = Alignment(vertical="center", wrap_text=True)
-    for item in scorecard.get("dimensions", []):
-        scorecard_sheet.append([_excel_safe(item.get("dimension")), item.get("pass_percentage"),
-                                _excel_safe(item.get("status")), _excel_safe(item.get("what_it_checks")),
-                                _excel_safe(item.get("criteria"))])
-    scorecard_sheet.freeze_panes = "A5"
-    scorecard_sheet.auto_filter.ref = scorecard_sheet.dimensions
-    scorecard_sheet.column_dimensions["A"].width = 34
-    scorecard_sheet.column_dimensions["B"].width = 14
-    scorecard_sheet.column_dimensions["C"].width = 18
-    scorecard_sheet.column_dimensions["D"].width = 78
-    scorecard_sheet.column_dimensions["E"].width = 28
+    steps_sheet = workbook.create_sheet("Next Steps")
+    steps_sheet.append(["Priority", "Issue", "What to do", "Affected chunks", "Source refs", "Pages"])
+    _style_header(steps_sheet)
+    for item in compact["next_steps"]:
+        steps_sheet.append([_excel_safe(item["priority"]), _excel_safe(item["issue"]),
+                            _excel_safe(item["next_step"]), _excel_safe(item["chunk_ids"]),
+                            _excel_safe(item["source_refs"]), _excel_safe(item["pages"])])
+    if not compact["next_steps"]:
+        steps_sheet.append(["", "No action needed", "No corrective actions were identified.", "", "", ""])
+    steps_sheet.freeze_panes = "A2"
+    steps_sheet.auto_filter.ref = steps_sheet.dimensions
+    for col, width in {"A": 14, "B": 36, "C": 78, "D": 28, "E": 26, "F": 14}.items():
+        steps_sheet.column_dimensions[col].width = width
+    _style_body(steps_sheet)
 
-    chunk_sheet = workbook.create_sheet("Chunk Results")
-    chunk_headers = ["chunk_id", "sequence", "section_id", "section_path", "page_numbers",
-                     "words", "characters", "source_alignment_confidence", "aligned_source_refs",
-                     "aligned_pages", "unsupported_token_ratio", "overall_score", "scored_dimensions",
-                     "detailed_PASS", "detailed_FAIL", "detailed_N/A", "detailed_INCONCLUSIVE",
-                     "detailed_scorable", "detailed_pass_percentage", "signed_score", "raw_score",
-                     "quality_gate", "chunk_excerpt"]
-    chunk_rows = [[item.get("chunk_id"), item.get("sequence_number"), item.get("section_id"),
-                   item.get("section_path"), item.get("page_numbers"), item.get("word_count"),
-                   item.get("character_count"), item.get("alignment_confidence"),
-                   item.get("aligned_source_refs"), item.get("aligned_pages"),
-                   item.get("unsupported_token_ratio"), item.get("overall_score"), item.get("scored_dimensions"),
-                   item.get("pass_count"), item.get("fail_count"), item.get("not_applicable_count"),
-                   item.get("inconclusive_count"), item.get("scorable_count"), item.get("pass_percentage"),
-                   item.get("signed_score"),
-                   item.get("raw_score"), item.get("quality_gate"), item.get("chunk_excerpt")]
-                  for item in report["chunks"]]
-    _append_table(chunk_sheet, chunk_headers, chunk_rows)
-    for row in range(2, chunk_sheet.max_row + 1):
-        gate = chunk_sheet.cell(row=row, column=22).value
-        if gate in _OUTCOME_FILLS:
-            chunk_sheet.cell(row=row, column=22).fill = _OUTCOME_FILLS[gate]
-
-    finding_sheet = workbook.create_sheet("Findings")
-    finding_headers = ["finding_id", "scope", "chunk_id", "sequence", "criterion_id", "category",
-                       "criterion", "outcome", "severity", "explanation", "confidence",
-                       "human_review_required", "method", "source_evidence_refs", "chunk_evidence_refs",
-                       "source_excerpt", "chunk_excerpt"]
-    finding_rows = [[item.get(key) for key in [
-        "finding_id", "scope", "chunk_id", "sequence_number", "criterion_id", "category",
-        "criterion", "outcome", "severity", "explanation", "confidence",
-        "human_review_required", "method", "source_evidence_refs", "chunk_evidence_refs",
-        "source_excerpt", "chunk_excerpt",
-    ]] for item in report["findings"]]
-    _append_table(finding_sheet, finding_headers, finding_rows)
-    for row in range(2, finding_sheet.max_row + 1):
-        outcome = finding_sheet.cell(row=row, column=8).value
+    evidence_sheet = workbook.create_sheet("Evidence to Review")
+    evidence_sheet.append(["Chunk", "Check", "Result", "Severity", "Why flagged", "Source refs",
+                           "Chunk refs", "Source excerpt", "Chunk excerpt"])
+    _style_header(evidence_sheet)
+    for item in compact["evidence_to_review"]:
+        evidence_sheet.append([_excel_safe(item["chunk_id"]), _excel_safe(item["criterion"]),
+                               _excel_safe(item["outcome"]), _excel_safe(item["severity"]),
+                               _excel_safe(item["explanation"]), _excel_safe(item["source_refs"]),
+                               _excel_safe(item["chunk_refs"]), _excel_safe(item["source_excerpt"]),
+                               _excel_safe(item["chunk_excerpt"])])
+    if not compact["evidence_to_review"]:
+        evidence_sheet.append(["", "No failed or inconclusive scorecard checks", "", "", "", "", "", "", ""])
+    evidence_sheet.freeze_panes = "A2"
+    evidence_sheet.auto_filter.ref = evidence_sheet.dimensions
+    for col, width in {"A": 20, "B": 32, "C": 16, "D": 14, "E": 62, "F": 24,
+                       "G": 24, "H": 42, "I": 42}.items():
+        evidence_sheet.column_dimensions[col].width = width
+    _style_body(evidence_sheet)
+    for row in range(2, evidence_sheet.max_row + 1):
+        outcome = evidence_sheet.cell(row=row, column=3).value
         if outcome in _OUTCOME_FILLS:
-            finding_sheet.cell(row=row, column=8).fill = _OUTCOME_FILLS[outcome]
-
-    sections_sheet = workbook.create_sheet("Sections")
-    section_headers = ["section_id", "section_title", "section_path", "chunk_count",
-                       "covered_source_units", "source_unit_count", "source_coverage_percentage",
-                       "failed_chunks", "PASS", "FAIL", "N/A", "INCONCLUSIVE", "scorable",
-                       "pass_percentage", "signed_score", "raw_score"]
-    section_rows = [[item.get("section_id"), item.get("section_title"), item.get("section_path"),
-                    item.get("chunk_count"), item.get("covered_source_units"),
-                    item.get("source_unit_count"),
-                    (100 * item["covered_source_units"] / item["source_unit_count"]
-                     if item.get("source_unit_count") else None), item.get("failed_chunks"),
-                    item.get("pass_count"), item.get("fail_count"), item.get("not_applicable_count"),
-                    item.get("inconclusive_count"), item.get("scorable_count"),
-                    item.get("pass_percentage"), item.get("signed_score"), item.get("raw_score")]
-                   for item in report["sections"]]
-    _append_table(sections_sheet, section_headers, section_rows)
-
-    coverage_sheet = workbook.create_sheet("Coverage")
-    coverage_headers = ["record_type", "source_ref", "page_number", "section_path", "matched_chunk_ids",
-                        "coverage_status", "source_excerpt", "explanation"]
-    coverage_rows = []
-    for item in report["coverage"]["unmatched_docx_units"]:
-        coverage_rows.append(["DOCX_SOURCE_UNIT", item["source_ref"], "", item["section_path"], "",
-                              "MISSING_FROM_CHUNKS", item["source_excerpt"],
-                              "Supported by PDF" if item["supported_by_pdf"] else "PDF support is uncertain; review upstream conversion."])
-    for item in report["coverage"]["pdf_docx_upstream_issues"]:
-        coverage_rows.append(["PDF_DOCX_UPSTREAM_ISSUE", item["source_ref"], item["page_number"], "", "",
-                              item["classification"], item["source_excerpt"], item["explanation"]])
-    if not coverage_rows:
-        coverage_rows.append(["SUMMARY", "", "", "", "", "NO_UNMATCHED_SOURCE_UNITS",
-                              "", f"{report['coverage']['covered_source_units']} of {report['coverage']['eligible_source_units']} DOCX units covered."])
-    _append_table(coverage_sheet, coverage_headers, coverage_rows)
-
-    criteria_sheet = workbook.create_sheet("Detailed Checks")
-    criteria_headers = ["criterion_id", "category", "criterion", "scope", "evaluation_method", "PASS",
-                        "FAIL", "N/A", "INCONCLUSIVE", "scorable", "pass_percentage", "signed_score"]
-    criteria_rows = [[item.get("id"), item.get("category"), item.get("name"), item.get("scope"),
-                      item.get("method"), item.get("pass_count"), item.get("fail_count"),
-                      item.get("not_applicable_count"), item.get("inconclusive_count"),
-                      item.get("scorable_count"), item.get("pass_percentage"), item.get("signed_score")]
-                     for item in report["criteria_summary"]]
-    _append_table(criteria_sheet, criteria_headers, criteria_rows)
-
-    audit_sheet = workbook.create_sheet("Input Audit")
-    audit_rows = [
-        ["pdflens_package_sha256", report["inputs"]["pdflens_package_sha256"]],
-        ["chunks_sha256", report["inputs"]["chunks_sha256"]],
-        ["source_pdf_sha256", report["inputs"]["source_pdf_sha256"]],
-        ["source_docx_sha256", report["inputs"]["source_docx_sha256"]],
-        ["source_pdf_member", report["inputs"]["source_pdf_member"]],
-        ["source_docx_member", report["inputs"]["source_docx_member"]],
-        ["PDF page count", report["inputs"]["pdf_page_count"]],
-        ["chunk input count", report["inputs"]["chunk_input_count"]],
-        ["alignment source", report["source_kind_for_alignment"]],
-        ["criteria version", report["criteria_version"]],
-        ["LLM settings", report["llm"]],
-        ["evidence notes", report["evidence_notes"]],
-        ["package members", report["inputs"]["package_members"]],
-        ["configuration", report["configuration"]],
-    ]
-    audit_sheet.append(["Field", "Value"])
-    for cell in audit_sheet[1]:
-        cell.fill = _HEADER_FILL
-        cell.font = Font(bold=True, color="FFFFFF")
-    for row in audit_rows:
-        audit_sheet.append([_excel_safe(value) for value in row])
-    audit_sheet.column_dimensions["A"].width = 34
-    audit_sheet.column_dimensions["B"].width = 100
-    for row in audit_sheet.iter_rows(min_row=2):
-        row[0].fill = _SUBHEADER_FILL
-        row[0].font = Font(bold=True)
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            evidence_sheet.cell(row=row, column=3).fill = _OUTCOME_FILLS[outcome]
 
     output = BytesIO()
     workbook.save(output)
@@ -274,4 +250,5 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
 
 
 def report_json_bytes(report: dict[str, Any]) -> bytes:
-    return (json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    compact = compact_report(report)
+    return (json.dumps(compact, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")

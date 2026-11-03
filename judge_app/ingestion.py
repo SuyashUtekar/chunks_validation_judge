@@ -186,6 +186,14 @@ def normalize_chunks(raw: bytes, filename: str) -> list[dict[str, Any]]:
     if len(raw) > settings.max_chunks_bytes:
         raise InputValidationError("Chunk file exceeds the configured size limit.")
     rows = _read_rows(raw, filename)
+    file_metadata: dict[str, Any] = {}
+    if PurePosixPath(filename).suffix.casefold() == ".json":
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InputValidationError("Chunk JSON is not valid JSON.") from exc
+        if isinstance(payload, dict):
+            file_metadata = {key: payload[key] for key in ("source_docx", "document_title", "document", "chunk_count", "max_words", "overlap_words") if key in payload}
     if not rows:
         raise InputValidationError("Chunk file contains no chunk records.")
     if len(rows) > settings.max_chunks:
@@ -225,6 +233,13 @@ def normalize_chunks(raw: bytes, filename: str) -> list[dict[str, Any]]:
             "start_offset": row.get("start_offset", source.get("start_offset")),
             "end_offset": row.get("end_offset", source.get("end_offset")),
             "document_id": str(row.get("document_id") or ""),
+            "document": str(row.get("document") or ""),
+            "document_title": str(row.get("document_title") or file_metadata.get("document_title") or ""),
+            "source_docx": str(row.get("source_docx") or file_metadata.get("source_docx") or ""),
+            "section_level": row.get("section_level"),
+            "part": row.get("part"),
+            "word_count": row.get("word_count"),
+            "chunk_file_metadata": file_metadata,
             "job_id": str(row.get("job_id", row.get("chunking_job_id")) or ""),
             "strategy": str(row.get("chunking_strategy") or row.get("strategy") or ""),
             "metadata": row.get("metadata") if isinstance(row.get("metadata"), dict) else {},
