@@ -10,12 +10,14 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from . import __version__
 from .action_plan import build_action_plan
 from .scorecard import build_scorecard, core_critical_failure, score_criterion_ids
 from .evidence import build_source_evidence
 from .ingestion import InputBundle
+from .config import settings
 from .llm import LLMUnavailableError, OpenAICompatibleJudge
 
 logger = logging.getLogger(__name__)
@@ -199,6 +201,7 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
     calls_succeeded = 0
     chunks_without_evidence = 0
     invalid_criterion_results = 0
+    prepared: list[dict[str, Any]] = []
     for chunk in chunks:
         candidates = matches.get(chunk["chunk_id"], [])
         evidence_units = [candidate["unit"] for candidate in candidates[:3] if candidate["score"] >= 0.18]
@@ -207,17 +210,17 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
         relevant_ids = sorted(_LLM_IDS)
         if not chunk.get("entities") and not config.get("entity_map"):
             relevant_ids = [criterion_id for criterion_id in relevant_ids if criterion_id not in {"E03", "E04"}]
+        local_findings: list[dict[str, Any]] = []
         if "K03" in relevant_ids and not _VISUAL_TAG_RE.search(chunk["content"]):
             relevant_ids.remove("K03")
-            findings.append(_finding("K03", "N/A", "Chunk contains no table/image tag.", chunk=chunk))
+            local_findings.append(_finding("K03", "N/A", "Chunk contains no table/image tag.", chunk=chunk))
         if not evidence_units:
             chunks_without_evidence += 1
             logger.warning("llm_call_skipped_no_source_evidence evaluation_id=%s chunk_id=%s candidate_count=%s",
                            evaluation_id, chunk["chunk_id"], len(candidates))
-            for criterion_id in relevant_ids:
-                findings.append(_finding(criterion_id, "INCONCLUSIVE",
-                                         "No reliable source passage aligned to this chunk.", chunk=chunk,
-                                         chunk_refs=[chunk_ref], human_review=True))
+            prepared.append({"chunk": chunk, "relevant_ids": relevant_ids, "evidence_units": evidence_units,
+                             "refs": refs, "chunk_ref": chunk_ref, "payload": None,
+                             "local_findings": local_findings})
             continue
         payload = {
             "evaluation_id": evaluation_id,
@@ -241,71 +244,105 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
             "chunking_configuration": {key: value for key, value in config.items()
                                        if key != "entity_map"},
         }
+        prepared.append({"chunk": chunk, "relevant_ids": relevant_ids, "evidence_units": evidence_units,
+                         "refs": refs, "chunk_ref": chunk_ref, "payload": payload,
+                         "local_findings": local_findings})
+
+    call_items = [item for item in prepared if item["payload"] is not None]
+    calls_attempted = len(call_items)
+
+    def _request(item: dict[str, Any]) -> tuple[dict[str, Any] | None, LLMUnavailableError | None]:
         try:
-            calls_attempted += 1
-            response = judge.judge(payload)
-            calls_succeeded += 1
-            returned = {}
-            for item in response["criteria"]:
-                cid = item.get("criterion_id")
-                if cid not in relevant_ids or cid in returned:
-                    continue
-                outcome = item.get("outcome")
-                if outcome not in _OUTCOMES:
-                    continue
-                source_refs = item.get("source_evidence_refs", [])
-                chunk_refs = item.get("chunk_evidence_refs", [])
-                if not isinstance(source_refs, list) or not isinstance(chunk_refs, list):
-                    continue
-                if any(ref not in refs for ref in source_refs) or any(ref != chunk_ref for ref in chunk_refs):
-                    continue
-                if outcome == "FAIL" and (not source_refs or not chunk_refs):
-                    outcome = "INCONCLUSIVE"
-                severity = item.get("severity")
-                if severity not in _SEVERITIES:
-                    severity = None
-                try:
-                    confidence = max(0.0, min(1.0, float(item.get("confidence"))))
-                except (TypeError, ValueError):
-                    confidence = None
-                findings.append(_finding(
-                    cid, outcome, _truncate(str(item.get("explanation") or "No explanation supplied."), 1000),
-                    chunk=chunk, source_refs=source_refs, chunk_refs=chunk_refs,
-                    source_excerpt=evidence_units[0]["text"], chunk_excerpt=chunk["content"],
-                    severity=severity, confidence=confidence,
-                    human_review=bool(item.get("human_review_required", outcome in {"FAIL", "INCONCLUSIVE"})),
-                ))
-                returned[cid] = True
-            invalid_count = len(relevant_ids) - len(returned)
-            invalid_criterion_results += invalid_count
-            if invalid_count:
-                logger.warning(
-                    "llm_response_criteria_rejected evaluation_id=%s chunk_id=%s expected=%s accepted=%s rejected=%s",
-                    evaluation_id, chunk["chunk_id"], len(relevant_ids), len(returned), invalid_count,
-                )
-            for cid in relevant_ids:
-                if cid not in returned:
-                    findings.append(_finding(cid, "INCONCLUSIVE", "Judge response omitted or invalidated this criterion.",
-                                             chunk=chunk, source_refs=refs[:1], chunk_refs=[chunk_ref],
-                                             human_review=True))
+            return judge.judge(item["payload"]), None
         except LLMUnavailableError as exc:
+            return None, exc
+
+    worker_count = min(settings.llm_max_workers, len(call_items)) if call_items else 0
+    logger.info("llm_parallel_calls_started evaluation_id=%s chunks=%s workers=%s",
+                evaluation_id, len(call_items), worker_count)
+    if call_items:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="chunk-judge") as executor:
+            call_results = iter(executor.map(_request, call_items))
+    else:
+        call_results = iter(())
+
+    for item in prepared:
+        chunk = item["chunk"]
+        findings.extend(item["local_findings"])
+        relevant_ids = item["relevant_ids"]
+        evidence_units = item["evidence_units"]
+        refs = item["refs"]
+        chunk_ref = item["chunk_ref"]
+        if item["payload"] is None:
+            for cid in relevant_ids:
+                findings.append(_finding(cid, "INCONCLUSIVE", "No reliable source passage aligned to this chunk.",
+                                         chunk=chunk, chunk_refs=[chunk_ref], human_review=True))
+            continue
+        response, error = next(call_results)
+        if error:
             llm_errors += 1
             logger.error("llm_chunk_evaluation_failed evaluation_id=%s chunk_id=%s reason=%s",
-                         evaluation_id, chunk["chunk_id"], exc)
+                         evaluation_id, chunk["chunk_id"], error)
             for cid in relevant_ids:
-                findings.append(_finding(cid, "INCONCLUSIVE", str(exc), chunk=chunk,
+                findings.append(_finding(cid, "INCONCLUSIVE", str(error), chunk=chunk,
                                          source_refs=refs[:1], chunk_refs=[chunk_ref], human_review=True))
+            continue
+        calls_succeeded += 1
+        returned = {}
+        for result_item in response["criteria"]:
+            cid = result_item.get("criterion_id")
+            if cid not in relevant_ids or cid in returned:
+                continue
+            outcome = result_item.get("outcome")
+            if outcome not in _OUTCOMES:
+                continue
+            source_refs = result_item.get("source_evidence_refs", [])
+            chunk_refs = result_item.get("chunk_evidence_refs", [])
+            if not isinstance(source_refs, list) or not isinstance(chunk_refs, list):
+                continue
+            if any(ref not in refs for ref in source_refs) or any(ref != chunk_ref for ref in chunk_refs):
+                continue
+            if outcome == "FAIL" and (not source_refs or not chunk_refs):
+                outcome = "INCONCLUSIVE"
+            severity = result_item.get("severity")
+            if severity not in _SEVERITIES:
+                severity = None
+            try:
+                confidence = max(0.0, min(1.0, float(result_item.get("confidence"))))
+            except (TypeError, ValueError):
+                confidence = None
+            findings.append(_finding(
+                cid, outcome, _truncate(str(result_item.get("explanation") or "No explanation supplied."), 1000),
+                chunk=chunk, source_refs=source_refs, chunk_refs=chunk_refs,
+                source_excerpt=evidence_units[0]["text"], chunk_excerpt=chunk["content"],
+                severity=severity, confidence=confidence,
+                human_review=bool(result_item.get("human_review_required", outcome in {"FAIL", "INCONCLUSIVE"})),
+            ))
+            returned[cid] = True
+        invalid_count = len(relevant_ids) - len(returned)
+        invalid_criterion_results += invalid_count
+        if invalid_count:
+            logger.warning(
+                "llm_response_criteria_rejected evaluation_id=%s chunk_id=%s expected=%s accepted=%s rejected=%s",
+                evaluation_id, chunk["chunk_id"], len(relevant_ids), len(returned), invalid_count,
+            )
+        for cid in relevant_ids:
+            if cid not in returned:
+                findings.append(_finding(cid, "INCONCLUSIVE", "Judge response omitted or invalidated this criterion.",
+                                         chunk=chunk, source_refs=refs[:1], chunk_refs=[chunk_ref],
+                                         human_review=True))
     logger.info(
         "llm_evaluation_calls_finished evaluation_id=%s configured=true attempted=%s succeeded=%s "
-        "failed=%s chunks_without_source=%s rejected_criterion_results=%s",
+        "failed=%s chunks_without_source=%s rejected_criterion_results=%s workers=%s",
         evaluation_id, calls_attempted, calls_attempted - llm_errors, llm_errors,
-        chunks_without_evidence, invalid_criterion_results,
+        chunks_without_evidence, invalid_criterion_results, worker_count,
     )
     return {"configured": True, "provider": "openai_compatible_on_prem",
             "model": judge.model, "calls_attempted": calls_attempted,
             "calls_succeeded": calls_succeeded, "failed_chunk_calls": llm_errors,
             "chunks_without_source_evidence": chunks_without_evidence,
             "invalid_criterion_results": invalid_criterion_results,
+            "parallel_workers": worker_count,
             "prompt_version": "chunk_judge_v4"}
 
 

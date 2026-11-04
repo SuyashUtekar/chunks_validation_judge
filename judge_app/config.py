@@ -35,6 +35,7 @@ class Settings:
     llm_model: str | None = os.getenv("JUDGE_LLM_MODEL")
     llm_api_key: str | None = os.getenv("JUDGE_LLM_API_KEY")
     llm_timeout_seconds: int = _integer("JUDGE_LLM_TIMEOUT_SECONDS", 90)
+    llm_max_workers: int = min(8, _integer("JUDGE_LLM_MAX_WORKERS", 4))
     llm_allow_remote: bool = os.getenv("JUDGE_LLM_ALLOW_REMOTE", "false").casefold() == "true"
     llm_json_mode: bool = os.getenv("JUDGE_LLM_JSON_MODE", "true").casefold() == "true"
 
@@ -42,8 +43,8 @@ class Settings:
 settings = Settings()
 logger.info(
     "judge_settings_loaded llm_url_configured=%s llm_model_configured=%s "
-    "llm_api_key_configured=%s llm_json_mode=%s llm_timeout_seconds=%s "
+    "llm_api_key_configured=%s llm_json_mode=%s llm_timeout_seconds=%s llm_max_workers=%s "
     "remote_llm_allowed=%s",
     bool(settings.llm_base_url), bool(settings.llm_model), bool(settings.llm_api_key),
-    settings.llm_json_mode, settings.llm_timeout_seconds, settings.llm_allow_remote,
+    settings.llm_json_mode, settings.llm_timeout_seconds, settings.llm_max_workers, settings.llm_allow_remote,
 )
