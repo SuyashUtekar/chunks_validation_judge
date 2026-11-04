@@ -3,13 +3,28 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-# Five top-level measures; the individual findings remain available as supporting evidence.
+# Five LLM-judged sectionwise criteria; deterministic checks remain diagnostics.
 _SCORE_DIMENSIONS = {
-    "Content coverage": ({"C01", "C03"}, "Checks whether DOCX source text is represented in the chunks."),
-    "Content fidelity": ({"C02", "C05", "C06"}, "Checks meaning, key facts, numbers, conditions, and negation against supplied source evidence."),
-    "Section placement": ({"S01", "S02", "S03", "S04", "S05"}, "Checks chunk paths and section coverage against the DOCX heading hierarchy."),
-    "Chunk coherence and usefulness": ({"M01", "M02", "M03", "M05", "B01", "B03"}, "Checks that chunk boundaries preserve a readable, useful idea."),
-    "Traceability": ({"T01", "T03"}, "Checks that chunk IDs are unique and section paths resolve."),
+    "Source accuracy": (
+        {"C02"},
+        "LLM compares chunk claims with the supplied DOCX source passages.",
+    ),
+    "Conditions and negation": (
+        {"C06"},
+        "LLM checks that conditions, exceptions, negation, and obligation strength retain their source meaning.",
+    ),
+    "Section assignment": (
+        {"S01"},
+        "LLM checks whether the chunk's section path fits its content and DOCX section context.",
+    ),
+    "Topic coherence": (
+        {"M01"},
+        "LLM checks whether the chunk contains one coherent topic or a closely related group of points.",
+    ),
+    "Chunk boundaries": (
+        {"B03"},
+        "LLM checks whether related concepts stay together and unrelated material is not combined in a harmful way.",
+    ),
 }
 
 
@@ -17,13 +32,16 @@ def _score(findings: list[dict[str, Any]]) -> dict[str, Any]:
     counts = Counter(item["outcome"] for item in findings)
     passed, failed = counts["PASS"], counts["FAIL"]
     total = passed + failed
+    score_points = passed - failed
     return {
         "pass_count": passed,
         "fail_count": failed,
         "inconclusive_count": counts["INCONCLUSIVE"],
         "not_applicable_count": counts["N/A"],
         "scorable_count": total,
-        "pass_percentage": round(100 * passed / total, 2) if total else None,
+        "score_points": score_points,
+        "max_points": total,
+        "pass_percentage": round(100 * (score_points + total) / (2 * total), 2) if total else None,
     }
 
 
@@ -34,6 +52,7 @@ def build_scorecard(findings: list[dict[str, Any]], *, include_document: bool = 
     for name, (criterion_ids, description) in _SCORE_DIMENSIONS.items():
         selected = [item for item in findings
                     if item.get("criterion_id") in criterion_ids
+                    and item.get("method") == "llm"
                     and (include_document or item.get("scope") != "document")]
         if not selected:
             continue
@@ -58,12 +77,16 @@ def build_scorecard(findings: list[dict[str, Any]], *, include_document: bool = 
             **score,
         })
 
-    scored = [item["pass_percentage"] for item in dimensions if item["pass_percentage"] is not None]
-    overall = round(sum(scored) / len(scored), 2) if scored else None
     counts = Counter(item.get("outcome") for item in core_findings)
+    conclusive = counts["PASS"] + counts["FAIL"]
+    overall = round(100 * counts["PASS"] / conclusive, 2) if conclusive else None
+    net_points = sum(item["score_points"] for item in dimensions)
+    max_points = sum(item["max_points"] for item in dimensions)
     return {
         "overall_score": overall,
-        "scored_dimensions": len(scored),
+        "net_score_points": net_points,
+        "max_score_points": max_points,
+        "scored_dimensions": sum(item["scorable_count"] > 0 for item in dimensions),
         "dimension_count": len(dimensions),
         "pass_count": counts["PASS"],
         "fail_count": counts["FAIL"],
@@ -72,8 +95,13 @@ def build_scorecard(findings: list[dict[str, Any]], *, include_document: bool = 
     }
 
 
+def score_criterion_ids() -> set[str]:
+    """Return only criteria that contribute to the sectionwise score and gate."""
+    return set().union(*(criterion_ids for criterion_ids, _ in _SCORE_DIMENSIONS.values()))
+
+
 def core_critical_failure(findings: list[dict[str, Any]]) -> bool:
-    selected_ids = set().union(*(criterion_ids for criterion_ids, _ in _SCORE_DIMENSIONS.values()))
+    selected_ids = score_criterion_ids()
     return any(
         item.get("criterion_id") in selected_ids
         and item.get("outcome") == "FAIL"

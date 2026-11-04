@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -12,17 +13,25 @@ import uuid
 
 from . import __version__
 from .action_plan import build_action_plan
-from .scorecard import build_scorecard, core_critical_failure
+from .scorecard import build_scorecard, core_critical_failure, score_criterion_ids
 from .evidence import build_source_evidence
 from .ingestion import InputBundle
 from .llm import LLMUnavailableError, OpenAICompatibleJudge
 
+logger = logging.getLogger(__name__)
+
 _APP_ROOT = Path(__file__).resolve().parents[1]
 _CRITERIA = json.loads((_APP_ROOT / "judge_app" / "criteria.json").read_text(encoding="utf-8"))
-_CRITERIA_BY_ID = {item["id"]: item for item in _CRITERIA["criteria"]}
+_DIAGNOSTIC_CRITERIA = json.loads(
+    (_APP_ROOT / "judge_app" / "diagnostic_criteria.json").read_text(encoding="utf-8")
+)
+_CRITERIA_BY_ID = {
+    item["id"]: item
+    for item in [*_CRITERIA["criteria"], *_DIAGNOSTIC_CRITERIA["criteria"]]
+}
 _OUTCOMES = {"PASS", "FAIL", "N/A", "INCONCLUSIVE"}
 _SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
-_LLM_IDS = {item["id"] for item in _CRITERIA["criteria"] if item["method"] == "llm"}
+_LLM_IDS = {"C02", "C06", "S01", "M01", "B03"}  # The only criteria that contribute to the sectionwise score.
 _STOPWORDS = set("a an and are as at be by for from in into is it of on or that the this to was were with".split())
 _TOKEN_RE = re.compile(r"[\w]+(?:[.,:/%-][\w]+)*", re.UNICODE)
 _NUMBER_RE = re.compile(r"(?<!\w)(?:\d{1,4}[-/.]){1,2}\d{1,4}|\d[\d,]*(?:\.\d+)?\s*%?", re.UNICODE)
@@ -157,14 +166,20 @@ def _finding(criterion_id: str, outcome: str, explanation: str, *, chunk: dict[s
         "confidence": confidence,
         "human_review_required": human_review,
         "method": criterion["method"],
+        "score_points": ({"PASS": 1, "FAIL": -1}.get(outcome, 0)
+                         if criterion_id in _LLM_IDS else None),
+        "score_rule": ("PASS=+1; FAIL=-1; INCONCLUSIVE/N/A=0"
+                       if criterion_id in _LLM_IDS else None),
     }
 
 
 def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict[str, Any]]],
-                      findings: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+                      findings: list[dict[str, Any]], config: dict[str, Any],
+                      evaluation_id: str) -> dict[str, Any]:
     try:
         judge = OpenAICompatibleJudge()
     except LLMUnavailableError as exc:
+        logger.error("llm_judge_unavailable evaluation_id=%s reason=%s", evaluation_id, exc)
         for chunk in chunks:
             for criterion_id in sorted(_LLM_IDS):
                 if criterion_id == "K03" and not _VISUAL_TAG_RE.search(chunk["content"]):
@@ -175,9 +190,15 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
                     findings.append(_finding(criterion_id, "INCONCLUSIVE", str(exc), chunk=chunk,
                                              human_review=True))
         return {"configured": False, "provider": None, "model": None,
-                "note": "Contextual criteria were not scored because an on-prem endpoint is not configured."}
+                "calls_attempted": 0, "calls_succeeded": 0, "failed_chunk_calls": 0,
+                "chunks_without_source_evidence": 0, "invalid_criterion_results": 0,
+                "note": "LLM criteria could not be evaluated because the endpoint is not configured."}
 
     llm_errors = 0
+    calls_attempted = 0
+    calls_succeeded = 0
+    chunks_without_evidence = 0
+    invalid_criterion_results = 0
     for chunk in chunks:
         candidates = matches.get(chunk["chunk_id"], [])
         evidence_units = [candidate["unit"] for candidate in candidates[:3] if candidate["score"] >= 0.18]
@@ -190,14 +211,19 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
             relevant_ids.remove("K03")
             findings.append(_finding("K03", "N/A", "Chunk contains no table/image tag.", chunk=chunk))
         if not evidence_units:
+            chunks_without_evidence += 1
+            logger.warning("llm_call_skipped_no_source_evidence evaluation_id=%s chunk_id=%s candidate_count=%s",
+                           evaluation_id, chunk["chunk_id"], len(candidates))
             for criterion_id in relevant_ids:
                 findings.append(_finding(criterion_id, "INCONCLUSIVE",
                                          "No reliable source passage aligned to this chunk.", chunk=chunk,
                                          chunk_refs=[chunk_ref], human_review=True))
             continue
         payload = {
+            "evaluation_id": evaluation_id,
             "criteria": [{"criterion_id": cid, "name": _CRITERIA_BY_ID[cid]["name"]}
                          for cid in relevant_ids],
+            "scoring_instruction": "Return outcomes only for the supplied criteria. These criterion outcomes alone determine the score; other deterministic diagnostics do not contribute.",
             "chunk": {"chunk_id": chunk["chunk_id"],
                       "content": _truncate(chunk["body_content"] or chunk["content"], 8000),
                       "section_path": chunk["section_path"]},
@@ -216,7 +242,9 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
                                        if key != "entity_map"},
         }
         try:
+            calls_attempted += 1
             response = judge.judge(payload)
+            calls_succeeded += 1
             returned = {}
             for item in response["criteria"]:
                 cid = item.get("criterion_id")
@@ -248,6 +276,13 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
                     human_review=bool(item.get("human_review_required", outcome in {"FAIL", "INCONCLUSIVE"})),
                 ))
                 returned[cid] = True
+            invalid_count = len(relevant_ids) - len(returned)
+            invalid_criterion_results += invalid_count
+            if invalid_count:
+                logger.warning(
+                    "llm_response_criteria_rejected evaluation_id=%s chunk_id=%s expected=%s accepted=%s rejected=%s",
+                    evaluation_id, chunk["chunk_id"], len(relevant_ids), len(returned), invalid_count,
+                )
             for cid in relevant_ids:
                 if cid not in returned:
                     findings.append(_finding(cid, "INCONCLUSIVE", "Judge response omitted or invalidated this criterion.",
@@ -255,11 +290,22 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
                                              human_review=True))
         except LLMUnavailableError as exc:
             llm_errors += 1
+            logger.error("llm_chunk_evaluation_failed evaluation_id=%s chunk_id=%s reason=%s",
+                         evaluation_id, chunk["chunk_id"], exc)
             for cid in relevant_ids:
                 findings.append(_finding(cid, "INCONCLUSIVE", str(exc), chunk=chunk,
                                          source_refs=refs[:1], chunk_refs=[chunk_ref], human_review=True))
+    logger.info(
+        "llm_evaluation_calls_finished evaluation_id=%s configured=true attempted=%s succeeded=%s "
+        "failed=%s chunks_without_source=%s rejected_criterion_results=%s",
+        evaluation_id, calls_attempted, calls_attempted - llm_errors, llm_errors,
+        chunks_without_evidence, invalid_criterion_results,
+    )
     return {"configured": True, "provider": "openai_compatible_on_prem",
-            "model": judge.model, "failed_chunk_calls": llm_errors,
+            "model": judge.model, "calls_attempted": calls_attempted,
+            "calls_succeeded": calls_succeeded, "failed_chunk_calls": llm_errors,
+            "chunks_without_source_evidence": chunks_without_evidence,
+            "invalid_criterion_results": invalid_criterion_results,
             "prompt_version": "chunk_judge_v4"}
 
 
@@ -267,11 +313,14 @@ def _criterion_score(findings: list[dict[str, Any]]) -> dict[str, Any]:
     counts = Counter(item["outcome"] for item in findings)
     passed, failed = counts["PASS"], counts["FAIL"]
     denominator = passed + failed
+    net_points = passed - failed
     return {"pass_count": passed, "fail_count": failed,
             "not_applicable_count": counts["N/A"], "inconclusive_count": counts["INCONCLUSIVE"],
-            "scorable_count": denominator, "raw_score": passed - failed,
-            "pass_percentage": round(100 * passed / denominator, 2) if denominator else None,
-            "signed_score": round(100 * (passed - failed) / denominator, 2) if denominator else None}
+            "scorable_count": denominator, "score_points": net_points,
+            "max_points": denominator, "score_rule": "PASS=+1; FAIL=-1; INCONCLUSIVE/N/A=0",
+            "raw_score": net_points,
+            "pass_percentage": round(100 * (net_points + denominator) / (2 * denominator), 2) if denominator else None,
+            "signed_score": round(100 * net_points / denominator, 2) if denominator else None}
 
 
 def _chunk_gate(findings: list[dict[str, Any]], thresholds: dict[str, Any]) -> str:
@@ -290,6 +339,8 @@ def _chunk_gate(findings: list[dict[str, Any]], thresholds: dict[str, Any]) -> s
 
 def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str, Any],
              chunks_sha256: str) -> dict[str, Any]:
+    evaluation_id = f"chunk-eval-{uuid.uuid4()}"
+    logger.info("evaluation_started evaluation_id=%s chunks=%s", evaluation_id, len(chunks))
     evidence = build_source_evidence(bundle)
     source_units = evidence["docx_units"] or evidence["pdf_units"]
     source_kind = "docx" if evidence["docx_units"] else "pdf"
@@ -297,6 +348,12 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
     for chunk in chunks:
         _content_and_path(chunk, sections)
     matches = {chunk["chunk_id"]: _match_chunk(chunk, source_units) for chunk in chunks}
+    logger.info(
+        "source_alignment_complete evaluation_id=%s source_kind=%s docx_units=%s pdf_units=%s "
+        "chunks_with_candidates=%s",
+        evaluation_id, source_kind, len(evidence["docx_units"]), len(evidence["pdf_units"]),
+        sum(bool(items) for items in matches.values()),
+    )
 
     # Use stable, non-empty identifiers in reports while preserving duplicate-ID findings.
     identifier_counts = Counter(chunk["chunk_id"] for chunk in chunks if chunk["chunk_id"])
@@ -309,6 +366,8 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
         chunk["id_duplicate"] = identifier_counts.get(chunk["chunk_id"], 0) > 1
     # Re-key because blank IDs received stable placeholders.
     matches = {chunk["chunk_id"]: _match_chunk(chunk, source_units) for chunk in chunks}
+    logger.info("source_alignment_rekeyed evaluation_id=%s chunks_with_candidates=%s",
+                evaluation_id, sum(bool(items) for items in matches.values()))
 
     findings: list[dict[str, Any]] = []
     duplicate_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -403,7 +462,7 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
                                      confidence=alignment_confidence))
 
         if config.get("max_words") is not None:
-            actual = len(chunk["content"].split())
+            actual = len((chunk.get("body_content") or chunk["content"]).split())
             limit = int(config["max_words"])
             outcome = "PASS" if actual <= limit else "FAIL"
             findings.append(_finding("B04", outcome, f"Chunk has {actual} words; configured limit is {limit}.",
@@ -655,24 +714,25 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
                              confidence=0.85 if s05 != "INCONCLUSIVE" else None,
                              human_review=s05 == "INCONCLUSIVE", scope="document"))
 
-    llm_info = _add_llm_findings(chunks, matches, findings, config)
+    llm_info = _add_llm_findings(chunks, matches, findings, config, evaluation_id)
     for index, finding in enumerate(findings, start=1):
         finding["finding_id"] = f"finding-{index:07d}"
 
     chunk_reports = []
     for chunk in chunks:
         chunk_findings = [item for item in findings if item["chunk_id"] == chunk["chunk_id"]]
-        score = _criterion_score(chunk_findings)
         chunk_scorecard = build_scorecard(chunk_findings, include_document=False)
         chunk_reports.append({
             "chunk_id": chunk["chunk_id"], "sequence_number": chunk["sequence_number"] or chunk["row_number"],
             "section_id": chunk["section_id"], "section_path": chunk["section_path"],
             "page_numbers": chunk["page_numbers"], "word_count": len(chunk["content"].split()),
-            "character_count": len(chunk["content"]), "alignment_confidence": chunk["alignment_confidence"],
-            "aligned_source_refs": chunk["aligned_source_refs"], "aligned_pages": chunk["aligned_pages"],
-            "unsupported_token_ratio": chunk.get("unsupported_token_ratio"), **score,
-            "overall_score": chunk_scorecard["overall_score"],
-            "scored_dimensions": chunk_scorecard["scored_dimensions"],
+            "criteria_score_percent": chunk_scorecard["overall_score"],
+            "criteria_passed": chunk_scorecard["pass_count"],
+            "criteria_failed": chunk_scorecard["fail_count"],
+            "criteria_unresolved": chunk_scorecard["inconclusive_count"],
+            "criteria_net_points": chunk_scorecard["net_score_points"],
+            "criteria_max_points": chunk_scorecard["max_score_points"],
+            "aligned_source_refs": chunk["aligned_source_refs"],
             "quality_gate": _chunk_gate(chunk_findings, {
                 "pass_candidate_at": config.get("pass_candidate_at", 85),
                 "review_required_below": config.get("review_required_below", 65),
@@ -689,7 +749,7 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
                           )]
         section_findings = [finding for finding in findings
                             if finding["chunk_id"] in {item["chunk_id"] for item in section_chunks}]
-        section_score = _criterion_score(section_findings)
+        section_score = build_scorecard(section_findings, include_document=False)
         section_reports.append({
             "section_id": "/".join(path), "section_title": path[-1], "section_path": list(path),
             "chunk_count": len(section_chunks), "covered_source_units": sum(
@@ -697,20 +757,29 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
                 and unit_matches.get(unit["unit_id"], (False, [], 0))[0]),
             "source_unit_count": sum(1 for unit in eligible_units
                                       if tuple(unit["section_path"][:len(path)]) == path),
-            "failed_chunks": sum(item["fail_count"] > 0 for item in section_chunks), **section_score,
+            "chunks_needing_correction": sum(item["criteria_failed"] > 0 for item in section_chunks),
+            "criteria_score_percent": section_score["overall_score"],
+            "criteria_passed": section_score["pass_count"],
+            "criteria_failed": section_score["fail_count"],
+            "criteria_unresolved": section_score["inconclusive_count"],
+            "criteria_net_points": section_score["net_score_points"],
+            "criteria_max_points": section_score["max_score_points"],
         })
 
-    total_score = _criterion_score(findings)
+    scored_findings = [item for item in findings
+                       if item.get("criterion_id") in score_criterion_ids()
+                       and item.get("method") == "llm"]
+    total_score = _criterion_score(scored_findings)
     scorecard = build_scorecard(findings)
     pass_pct = scorecard["overall_score"]
     thresholds = {"pass_candidate_at": float(config.get("pass_candidate_at", 85)),
                   "review_required_below": float(config.get("review_required_below", 65))}
-    chunk_fail_count = sum(item["fail_count"] > 0 for item in chunk_reports)
+    chunk_fail_count = sum(item["criteria_failed"] > 0 for item in chunk_reports)
+    # Only sectionwise-scored criteria can trigger the scorecard's critical override.
+    # PDF conversion and optional semantic diagnostics remain visible without gating chunk quality.
     critical = sum(item["severity"] == "CRITICAL" for item in findings
-                   if item["outcome"] == "FAIL" and item["criterion_id"] in {
-                       "C01", "C03", "C02", "C05", "C06", "S01", "S02", "S03", "S04", "S05",
-                       "M01", "M02", "M03", "M05", "B01", "B03", "T01", "T03"})
-    high = sum(item["severity"] == "HIGH" for item in findings if item["outcome"] == "FAIL")
+                   if item["outcome"] == "FAIL" and item["criterion_id"] in score_criterion_ids())
+    high = sum(item["severity"] == "HIGH" for item in scored_findings if item["outcome"] == "FAIL")
     if not scorecard["scored_dimensions"]:
         gate = "REVIEW_REQUIRED" if scorecard["inconclusive_count"] else "NOT_EVALUATED"
     elif critical or (pass_pct is not None and pass_pct < thresholds["review_required_below"]):
@@ -723,7 +792,6 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
     input_metadata = bundle.metadata or {}
     processing = input_metadata.get("processing", {}) if isinstance(input_metadata, dict) else {}
     doc_info = input_metadata.get("document", {}) if isinstance(input_metadata, dict) else {}
-    evaluation_id = f"chunk-eval-{uuid.uuid4()}"
     summary = {
         "total_chunks": len(chunks), "chunks_with_failures": chunk_fail_count,
         "chunks_with_review_required": sum(item["quality_gate"] == "REVIEW_REQUIRED" for item in chunk_reports),
@@ -736,16 +804,33 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
         "pass_percentage": total_score["pass_percentage"], "signed_score": total_score["signed_score"],
         "raw_score": total_score["raw_score"], "overall_score": pass_pct,
         "scored_dimensions": scorecard["scored_dimensions"],
+        "core_passes": scorecard["pass_count"],
         "core_failures": scorecard["fail_count"],
-        "core_inconclusive": scorecard["inconclusive_count"], "critical_failures": critical,
+        "core_inconclusive": scorecard["inconclusive_count"],
+        "score_denominator": scorecard["pass_count"] + scorecard["fail_count"],
+        "net_score_points": scorecard["net_score_points"],
+        "max_score_points": scorecard["max_score_points"],
+        "llm_unresolved_checks": scorecard["inconclusive_count"],
+        "unresolved_reasons": dict(Counter(
+            item["explanation"] for item in scored_findings if item.get("outcome") == "INCONCLUSIVE"
+        )),
+        "critical_failures": critical,
         "high_failures": high, "source_coverage_percentage": round(coverage_pct, 2) if coverage_pct is not None else None,
         "eligible_source_units": len(eligible_units), "covered_source_units": covered_count,
         "missing_source_units": len(missing_units), "pdf_docx_discrepancies": len(upstream_issues),
     }
     criteria_summary = []
     for criterion in _CRITERIA["criteria"]:
-        results = [item for item in findings if item["criterion_id"] == criterion["id"]]
+        if criterion["id"] not in score_criterion_ids():
+            continue
+        results = [item for item in scored_findings if item["criterion_id"] == criterion["id"]]
         criteria_summary.append({**criterion, **_criterion_score(results)})
+    logger.info(
+        "evaluation_completed evaluation_id=%s quality_gate=%s score=%s net_points=%s "
+        "passed=%s failed=%s unresolved=%s",
+        evaluation_id, gate, pass_pct, scorecard["net_score_points"],
+        scorecard["pass_count"], scorecard["fail_count"], scorecard["inconclusive_count"],
+    )
     return {
         "evaluation_id": evaluation_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -761,7 +846,10 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
         "source_kind_for_alignment": source_kind,
         "summary": summary,
         "scorecard": scorecard,
-        "action_plan": build_action_plan(gate, findings, missing_units, upstream_issues),
+        "action_plan": build_action_plan(
+            gate, findings, missing_units, upstream_issues, llm_info=llm_info,
+            overall_score=pass_pct, review_boundary=thresholds["review_required_below"],
+        ),
         "coverage": {
             "source_coverage_percentage": summary["source_coverage_percentage"],
             "eligible_source_units": len(eligible_units), "covered_source_units": covered_count,

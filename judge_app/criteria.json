@@ -1,40 +1,40 @@
 {
-  "criteria_version": "proposed-2.0-mvp",
+  "criteria_version": "proposed-4.2-llm-points-sectionwise",
   "criteria": [
-    {"id":"C01","category":"Content integrity","name":"Source content coverage","scope":"document","method":"deterministic"},
-    {"id":"C02","category":"Content integrity","name":"Content accuracy","scope":"chunk","method":"llm"},
-    {"id":"C03","category":"Content integrity","name":"Missing information","scope":"document","method":"deterministic"},
-    {"id":"C04","category":"Content integrity","name":"Extra unsupported content","scope":"chunk","method":"deterministic"},
-    {"id":"C05","category":"Content integrity","name":"Numeric and factual preservation","scope":"chunk","method":"deterministic"},
-    {"id":"C06","category":"Content integrity","name":"Negation and condition preservation","scope":"chunk","method":"llm"},
-    {"id":"C07","category":"Content integrity","name":"Duplication control","scope":"chunk","method":"deterministic"},
-    {"id":"S01","category":"Section association","name":"Correct section assignment","scope":"chunk","method":"llm"},
-    {"id":"S02","category":"Section association","name":"Section hierarchy preservation","scope":"chunk","method":"deterministic"},
-    {"id":"S03","category":"Section association","name":"Section-title association","scope":"chunk","method":"llm"},
-    {"id":"S04","category":"Section association","name":"Cross-section contamination","scope":"chunk","method":"llm"},
-    {"id":"S05","category":"Section association","name":"Section coverage","scope":"document","method":"deterministic"},
-    {"id":"M01","category":"Semantic coherence","name":"Single-topic coherence","scope":"chunk","method":"llm"},
-    {"id":"M02","category":"Semantic coherence","name":"Internal logical flow","scope":"chunk","method":"llm"},
-    {"id":"M03","category":"Semantic coherence","name":"Semantic completeness","scope":"chunk","method":"llm"},
-    {"id":"M04","category":"Semantic coherence","name":"Contextual consistency","scope":"chunk","method":"llm"},
-    {"id":"M05","category":"Semantic coherence","name":"Retrieval usefulness","scope":"chunk","method":"llm"},
-    {"id":"B01","category":"Boundaries and segmentation","name":"Sentence boundary integrity","scope":"chunk","method":"llm"},
-    {"id":"B02","category":"Boundaries and segmentation","name":"Paragraph boundary integrity","scope":"chunk","method":"llm"},
-    {"id":"B03","category":"Boundaries and segmentation","name":"Concept boundary integrity","scope":"chunk","method":"llm"},
-    {"id":"B04","category":"Boundaries and segmentation","name":"Chunk size compliance","scope":"chunk","method":"deterministic"},
-    {"id":"B05","category":"Boundaries and segmentation","name":"Overlap appropriateness","scope":"chunk","method":"llm"},
-    {"id":"K01","category":"Context preservation","name":"Definition-context preservation","scope":"chunk","method":"llm"},
-    {"id":"K02","category":"Context preservation","name":"Reference resolution","scope":"chunk","method":"llm"},
-    {"id":"K03","category":"Context preservation","name":"Table/figure context","scope":"chunk","method":"llm"},
-    {"id":"K04","category":"Context preservation","name":"Cross-chunk context continuity","scope":"chunk","method":"llm"},
-    {"id":"E01","category":"Entity and reference consistency","name":"Entity preservation","scope":"chunk","method":"deterministic"},
-    {"id":"E02","category":"Entity and reference consistency","name":"Entity normalization consistency","scope":"chunk","method":"deterministic"},
-    {"id":"E03","category":"Entity and reference consistency","name":"Entity-to-context association","scope":"chunk","method":"llm"},
-    {"id":"E04","category":"Entity and reference consistency","name":"Coreference/reference consistency","scope":"chunk","method":"llm"},
-    {"id":"T01","category":"Metadata and traceability","name":"Chunk identifier integrity","scope":"chunk","method":"deterministic"},
-    {"id":"T02","category":"Metadata and traceability","name":"Page traceability","scope":"chunk","method":"deterministic"},
-    {"id":"T03","category":"Metadata and traceability","name":"Section traceability","scope":"chunk","method":"deterministic"},
-    {"id":"T04","category":"Metadata and traceability","name":"Sequence and offset consistency","scope":"chunk","method":"deterministic"},
-    {"id":"T05","category":"Metadata and traceability","name":"Chunk metadata completeness","scope":"chunk","method":"deterministic"}
+    {
+      "id": "C02",
+      "category": "Content integrity",
+      "name": "Content accuracy",
+      "scope": "chunk",
+      "method": "llm"
+    },
+    {
+      "id": "C06",
+      "category": "Content integrity",
+      "name": "Negation and condition preservation",
+      "scope": "chunk",
+      "method": "llm"
+    },
+    {
+      "id": "S01",
+      "category": "Section association",
+      "name": "Correct section assignment",
+      "scope": "chunk",
+      "method": "llm"
+    },
+    {
+      "id": "M01",
+      "category": "Semantic coherence",
+      "name": "Single-topic coherence",
+      "scope": "chunk",
+      "method": "llm"
+    },
+    {
+      "id": "B03",
+      "category": "Boundaries and segmentation",
+      "name": "Concept boundary integrity",
+      "scope": "chunk",
+      "method": "llm"
+    }
   ]
 }

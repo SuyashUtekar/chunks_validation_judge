@@ -2,7 +2,7 @@
 
 A standalone local FastAPI application that evaluates section-wise chunks against a PDFLens output package and creates an evidence-backed Excel report. It is separate from the PDFLens application.
 
-This is the first deterministic MVP from the implementation plan. It performs artifact validation, DOCX/PDF evidence extraction, section-aware chunk normalization, source alignment, rule-based checks, scoring, and Excel/JSON reporting. Contextual criteria are evaluated through an optional OpenAI-compatible **on-prem** model endpoint. Without that endpoint, those criteria are recorded as `INCONCLUSIVE`, never as `PASS`.
+The judge evaluates section-wise chunks against the DOCX supplied to the chunker. The score uses five LLM-judged criteria: C02 source accuracy, C06 condition/negation preservation, S01 section assignment, M01 topic coherence, and B03 chunk boundary quality. File parsing and source matching prepare evidence for LiteLLM; deterministic checks do not produce score outcomes. If LiteLLM is unavailable, the criteria are unresolved and no fallback score is calculated.
 
 ## Inputs
 
@@ -22,13 +22,12 @@ Example config:
   "max_words": 800,
   "overlap_words": 80,
   "required_metadata_fields": [],
-  "source_unit_coverage_pass_threshold": 85,
   "pass_candidate_at": 85,
   "review_required_below": 65
 }
 ```
 
-No page/section/entity fields are assumed mandatory when the chunk source does not provide them; their findings become `INCONCLUSIVE` or `N/A` as appropriate.
+The pass threshold and review boundary control the decision label only; they do not change the LLM score formula.
 
 ## Run locally
 
@@ -63,21 +62,19 @@ Or run `make run-ui`. Open `http://127.0.0.1:8501`. The optional configuration J
 
 ## Reports
 
-Downloads are intentionally concise. The JSON report contains the decision, source/chunk summary, five-point scorecard, grouped next steps, and up to 40 evidence-backed FAIL/INCONCLUSIVE rows. The Excel workbook has four sheets: **Overview**, **Scorecard**, **Next Steps**, and **Evidence to Review**. Longer diagnostics remain in the live app; they are not duplicated into the default downloads.
+Downloads are intentionally concise. The JSON report contains the decision, source/chunk summary, five-criterion scorecard, grouped next steps, and up to 40 evidence-backed FAIL/INCONCLUSIVE rows. The Excel workbook has four sheets: **Overview**, **Scorecard**, **Next Steps**, and **Evidence to Review**. Longer diagnostics remain in the live app; they are not duplicated into the default downloads.
 
-The initial criteria version is marked **proposed**. The judge reports five primary dimensions: content coverage, content fidelity, section placement, chunk coherence/usefulness, and traceability. Each dimension is supported by cited detailed checks; the detailed checks are evidence, not separate top-level score points. The overall score is the average of dimensions with enough evidence to score. Current provisional defaults are 85% for a pass candidate and 65% for the review boundary; these are not calibrated release thresholds. Critical failures still override the score. `N/A` and `INCONCLUSIVE` are reported separately.
+The criteria version is **proposed-4.2-llm-points-sectionwise**. The score uses exactly five LLM-judged criteria: **C02 Source accuracy**, **C06 Conditions and negation**, **S01 Section assignment**, **M01 Topic coherence**, and **B03 Chunk boundaries**. The LLM compares each chunk with candidate passages and section context from the DOCX consumed by the chunker. Parsing and source matching only prepare evidence; deterministic checks and PDF-to-DOCX comparisons are diagnostics and do not affect the score. Each criterion result is worth **+1** for PASS, **−1** for FAIL, and **0** for INCONCLUSIVE or N/A. The rating is derived from those points: **((net points ÷ conclusive checks) + 1) ÷ 2 × 100**. Checks the LLM could not assess are excluded from the formula and shown separately. A score of 85% or higher meets the pass threshold; below 65% or a critical scored failure needs correction; 65–84% or unresolved criteria needs review. Thresholds are provisional. `judge_app/criteria.json` contains only these five scored criteria. The former broad catalogue is in `judge_app/diagnostic_criteria.json`; those checks can add diagnostic findings but never contribute to scoring or the quality gate.
 
 ## Optional on-prem LLM
 
-No public model service is configured by default. LiteLLM Proxy is supported through its OpenAI-compatible Chat Completions API. Configure the proxy base URL and a model alias enabled in LiteLLM before starting the app:
+No public model service is configured by default. LiteLLM Proxy is supported through its OpenAI-compatible Chat Completions API. Copy `.env.example` to `.env`, then edit the values for your proxy:
 
 ```sh
-export JUDGE_LLM_BASE_URL='http://127.0.0.1:4000/v1'
-export JUDGE_LLM_MODEL='your-litellm-model-alias'
-export JUDGE_LLM_API_KEY='your-litellm-virtual-key'
+cp .env.example .env
 ```
 
-`JUDGE_LLM_BASE_URL` can be the proxy root (for example `http://127.0.0.1:4000`) or its `/v1` base URL; the app resolves either to the chat-completions route. `JUDGE_LLM_MODEL` must be the LiteLLM model alias available to that key. Set `JUDGE_LLM_JSON_MODE=false` if the selected LiteLLM model or deployment does not support JSON response mode. The evaluator sends compact chunk/source evidence, not the full PDF or full DOCX. The balanced, versioned rubric is in `prompts/chunk_judge_v4.txt`; it tolerates coherent adjacent subsections in one chunk while preserving strict checks for material content errors, and reports record the prompt version. It includes five concise calibration examples for related versus unrelated section grouping, upstream omissions, insufficient evidence, and a provable condition reversal. Configure `JUDGE_LLM_ALLOW_REMOTE=true` only when the endpoint has been reviewed and approved as internal. The default host check permits loopback and private-network endpoints. LLM responses are schema-checked; malformed, unsupported, or ungrounded results become `INCONCLUSIVE` and require review.
+Set `JUDGE_LLM_BASE_URL`, `JUDGE_LLM_MODEL`, and `JUDGE_LLM_API_KEY` in `.env`. The project loads this file at startup; shell environment variables take precedence. Keep `.env` private because it contains credentials, and restart the app after changing it. `JUDGE_LLM_BASE_URL` can be the proxy root (for example `http://127.0.0.1:4000`) or its `/v1` base URL; the app resolves either to the chat-completions route. `JUDGE_LLM_MODEL` must be the LiteLLM model alias available to that key. Set `JUDGE_LLM_JSON_MODE=false` if the selected LiteLLM model or deployment does not support JSON response mode. The evaluator sends compact chunk/source evidence, not the full PDF or full DOCX. The versioned LLM rubric is in `prompts/chunk_judge_v4.txt`; it tolerates coherent adjacent subsections in one chunk and requires evidence for failures. Reports record the prompt version. It includes five concise calibration examples for related versus unrelated section grouping, upstream omissions, insufficient evidence, and a provable condition reversal. Configure `JUDGE_LLM_ALLOW_REMOTE=true` only when the endpoint has been reviewed and approved as internal. The default host check permits loopback and private-network endpoints. LLM responses are schema-checked; malformed, unsupported, or ungrounded results become `INCONCLUSIVE` and require review.
 
 ## MVP boundaries
 

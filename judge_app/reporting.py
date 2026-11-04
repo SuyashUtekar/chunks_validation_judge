@@ -11,8 +11,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 _HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 _SUBHEADER_FILL = PatternFill("solid", fgColor="D9EAF7")
 _OUTCOME_FILLS = {
-    "FAIL": PatternFill("solid", fgColor="FCE4D6"),
-    "INCONCLUSIVE": PatternFill("solid", fgColor="FFF2CC"),
+    "Needs correction": PatternFill("solid", fgColor="FCE4D6"),
+    "Could not assess": PatternFill("solid", fgColor="FFF2CC"),
 }
 _MAX_EVIDENCE_ROWS = 40
 _MAX_REFERENCES = 8
@@ -62,6 +62,8 @@ def _evidence_to_review(report: dict[str, Any]) -> tuple[list[dict[str, Any]], i
             "chunk_id": item.get("chunk_id") or None,
             "criterion": item.get("criterion"),
             "outcome": item.get("outcome"),
+            "result_label": {"FAIL": "Needs correction", "INCONCLUSIVE": "Could not assess"}.get(item.get("outcome"), item.get("outcome")),
+            "score_points": item.get("score_points", 0),
             "severity": item.get("severity"),
             "explanation": _short(item.get("explanation")),
             "source_refs": (item.get("source_evidence_refs") or [])[:_MAX_REFERENCES],
@@ -81,9 +83,11 @@ def _compact_actions(report: dict[str, Any]) -> list[dict[str, Any]]:
             "priority": item.get("priority"),
             "issue": item.get("title"),
             "next_step": _short(item.get("what_to_do"), 320),
-            "affected_chunk_count": len(chunks),
+            "affected_chunk_count": item.get("affected_chunk_count", len(chunks)),
             "chunk_ids": chunks[:_MAX_REFERENCES],
+            "more_chunk_ids_count": item.get("more_chunk_ids_count", max(0, len(chunks) - _MAX_REFERENCES)),
             "source_refs": sources[:_MAX_REFERENCES],
+            "more_source_refs_count": item.get("more_source_refs_count", max(0, len(sources) - _MAX_REFERENCES)),
             "pages": (item.get("pages") or [])[:_MAX_REFERENCES],
             "criteria": (item.get("criterion_ids") or [])[:_MAX_REFERENCES],
         })
@@ -99,21 +103,25 @@ def compact_report(report: dict[str, Any]) -> dict[str, Any]:
     input_docx = report.get("inputs", {}).get("source_docx_member")
     scorecard = [
         {
-            "dimension": item.get("dimension"),
-            "score_percent": item.get("pass_percentage"),
+            "criterion": item.get("dimension"),
+            "pass_rate_percent": item.get("pass_percentage"),
             "result": item.get("status"),
+            "result_label": {"PASS": "Meets criterion", "FAIL": "Needs correction", "MIXED": "Some checks failed", "INCONCLUSIVE": "Needs evidence"}.get(item.get("status"), item.get("status")),
             "what_it_checks": item.get("what_it_checks"),
-            "scorable_checks": item.get("scorable_count"),
-            "failed_checks": item.get("fail_count"),
-            "unresolved_checks": item.get("inconclusive_count"),
+            "passed": item.get("pass_count"),
+            "failed": item.get("fail_count"),
+            "could_not_assess": item.get("inconclusive_count"),
+            "net_points": item.get("score_points", 0),
+            "max_points": item.get("max_points", 0),
         }
         for item in report.get("scorecard", {}).get("dimensions", [])
     ]
     return {
-        "report_version": "concise-1",
+        "report_version": "concise-3",
         "evaluation_id": report.get("evaluation_id"),
         "created_at": report.get("created_at"),
         "quality_gate": report.get("quality_gate"),
+        "quality_gate_label": {"PASS": "Meets threshold", "FAIL": "Needs correction", "REVIEW_REQUIRED": "Needs review", "NOT_EVALUATED": "Not evaluated"}.get(report.get("quality_gate"), report.get("quality_gate")),
         "what_this_means": report.get("action_plan", {}).get("summary"),
         "document": {
             "title": metadata.get("document_title") or report.get("document_id"),
@@ -125,8 +133,20 @@ def compact_report(report: dict[str, Any]) -> dict[str, Any]:
             "overlap_words": metadata.get("overlap_words"),
         },
         "overall_score_percent": summary.get("overall_score"),
+        "score_explanation": {
+            "criterion_points": {"PASS": 1, "FAIL": -1, "INCONCLUSIVE": 0, "N/A": 0},
+            "rating_formula": "((net_points / conclusive_checks) + 1) / 2 × 100",
+            "no_conclusive_checks": "No rating is calculated when all checks are unresolved or N/A.",
+            "net_points": summary.get("net_score_points", 0),
+            "max_points": summary.get("max_score_points", 0),
+            "passed": summary.get("core_passes", 0),
+            "failed": summary.get("core_failures", 0),
+            "could_not_assess": summary.get("core_inconclusive", 0),
+            "thresholds": report.get("quality_gate_thresholds", {}),
+        },
         "scorecard": scorecard,
         "coverage": {
+            "note": "Diagnostic only. These PDF/DOCX coverage measurements do not contribute to the LLM criteria score.",
             "docx_source_coverage_percent": summary.get("source_coverage_percentage"),
             "covered_source_units": summary.get("covered_source_units"),
             "eligible_source_units": summary.get("eligible_source_units"),
@@ -160,7 +180,7 @@ def _style_body(sheet: Any, min_row: int = 2) -> None:
 
 
 def build_report_xlsx(report: dict[str, Any]) -> bytes:
-    """Build a small workbook with an overview, five scores, actions, and limited evidence."""
+    """Build a workbook with the criterion score, plain-language result, actions, and evidence."""
     compact = compact_report(report)
     workbook = Workbook()
 
@@ -169,16 +189,22 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
     overview.append(["Result", "Details"])
     _style_header(overview)
     values = [
-        ("Decision", compact["quality_gate"]),
-        ("What this means", compact["what_this_means"]),
-        ("Overall score", compact["overall_score_percent"]),
+        ("Result", compact["what_this_means"]),
+        ("Decision", compact["quality_gate_label"]),
+        ("Criteria score (%)", compact["overall_score_percent"]),
+        ("Scoring rule", "PASS=+1; FAIL=-1; could not assess=0"),
+        ("Net points / maximum", f"{compact['score_explanation']['net_points']:+d} / {compact['score_explanation']['max_points']:+d}"),
+        ("Rating formula", compact["score_explanation"]["rating_formula"]),
+        ("Criteria passed", compact["score_explanation"]["passed"]),
+        ("Criteria failed", compact["score_explanation"]["failed"]),
+        ("Could not assess", compact["score_explanation"]["could_not_assess"]),
         ("Document", compact["document"]["title"]),
         ("Source DOCX", compact["document"]["source_docx"]),
         ("Chunk count", compact["document"]["chunk_count"]),
         ("Chunking strategy", compact["document"]["strategy"]),
-        ("DOCX source coverage", compact["coverage"]["docx_source_coverage_percent"]),
-        ("DOCX source units missing from chunks", compact["coverage"]["docx_units_not_in_chunks"]),
-        ("Possible PDF-to-DOCX omissions", compact["coverage"]["possible_pdf_to_docx_omissions"]),
+        ("DOCX coverage diagnostic (not scored)", compact["coverage"]["docx_source_coverage_percent"]),
+        ("DOCX units missing diagnostic (not scored)", compact["coverage"]["docx_units_not_in_chunks"]),
+        ("Possible PDF-to-DOCX diagnostic (not scored)", compact["coverage"]["possible_pdf_to_docx_omissions"]),
         ("Next steps", len(compact["next_steps"])),
         ("Evidence rows included", len(compact["evidence_to_review"])),
         ("Additional evidence rows omitted", compact["evidence_rows_omitted"]),
@@ -194,15 +220,16 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
         row[0].font = Font(bold=True)
 
     score_sheet = workbook.create_sheet("Scorecard")
-    score_sheet.append(["Dimension", "Score %", "Result", "What this checks", "Failed", "Unresolved"])
+    score_sheet.append(["Scored criterion", "Rating %", "Net points", "Max points", "Result", "Passed", "Failed", "Could not assess", "What this checks"])
     _style_header(score_sheet)
     for item in compact["scorecard"]:
-        score_sheet.append([_excel_safe(item["dimension"]), item["score_percent"],
-                            _excel_safe(item["result"]), _excel_safe(item["what_it_checks"]),
-                            item["failed_checks"], item["unresolved_checks"]])
+        score_sheet.append([_excel_safe(item["criterion"]), item["pass_rate_percent"],
+                            f"{item['net_points']:+d}", item["max_points"],
+                            _excel_safe(item["result_label"]), item["passed"], item["failed"],
+                            item["could_not_assess"], _excel_safe(item["what_it_checks"])])
     score_sheet.freeze_panes = "A2"
     score_sheet.auto_filter.ref = score_sheet.dimensions
-    for col, width in {"A": 32, "B": 14, "C": 18, "D": 76, "E": 12, "F": 14}.items():
+    for col, width in {"A": 32, "B": 14, "C": 14, "D": 12, "E": 22, "F": 12, "G": 12, "H": 18, "I": 76}.items():
         score_sheet.column_dimensions[col].width = width
     _style_body(score_sheet)
 
@@ -222,12 +249,12 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
     _style_body(steps_sheet)
 
     evidence_sheet = workbook.create_sheet("Evidence to Review")
-    evidence_sheet.append(["Chunk", "Check", "Result", "Severity", "Why flagged", "Source refs",
+    evidence_sheet.append(["Chunk", "Scored criterion", "What the judge decided", "Score points", "Severity", "Why flagged", "Source refs",
                            "Chunk refs", "Source excerpt", "Chunk excerpt"])
     _style_header(evidence_sheet)
     for item in compact["evidence_to_review"]:
         evidence_sheet.append([_excel_safe(item["chunk_id"]), _excel_safe(item["criterion"]),
-                               _excel_safe(item["outcome"]), _excel_safe(item["severity"]),
+                               _excel_safe(item["result_label"]), item["score_points"], _excel_safe(item["severity"]),
                                _excel_safe(item["explanation"]), _excel_safe(item["source_refs"]),
                                _excel_safe(item["chunk_refs"]), _excel_safe(item["source_excerpt"]),
                                _excel_safe(item["chunk_excerpt"])])
@@ -235,8 +262,8 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
         evidence_sheet.append(["", "No failed or inconclusive scorecard checks", "", "", "", "", "", "", ""])
     evidence_sheet.freeze_panes = "A2"
     evidence_sheet.auto_filter.ref = evidence_sheet.dimensions
-    for col, width in {"A": 20, "B": 32, "C": 16, "D": 14, "E": 62, "F": 24,
-                       "G": 24, "H": 42, "I": 42}.items():
+    for col, width in {"A": 20, "B": 32, "C": 22, "D": 14, "E": 14, "F": 62,
+                       "G": 24, "H": 24, "I": 42, "J": 42}.items():
         evidence_sheet.column_dimensions[col].width = width
     _style_body(evidence_sheet)
     for row in range(2, evidence_sheet.max_row + 1):

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 APP_ROOT = Path(__file__).resolve().parents[1]
+# Load project-local settings, while keeping shell-defined variables authoritative.
+load_dotenv(APP_ROOT / ".env", override=False)
 
 
 def _integer(name: str, default: int) -> int:
@@ -34,3 +40,10 @@ class Settings:
 
 
 settings = Settings()
+logger.info(
+    "judge_settings_loaded llm_url_configured=%s llm_model_configured=%s "
+    "llm_api_key_configured=%s llm_json_mode=%s llm_timeout_seconds=%s "
+    "remote_llm_allowed=%s",
+    bool(settings.llm_base_url), bool(settings.llm_model), bool(settings.llm_api_key),
+    settings.llm_json_mode, settings.llm_timeout_seconds, settings.llm_allow_remote,
+)

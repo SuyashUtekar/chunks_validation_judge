@@ -3,43 +3,12 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+_SCORE_CRITERIA = {"C02", "C06", "S01", "M01", "B03"}
 _ACTIONS = {
-    "coverage": (
-        "Check missing source text",
-        "Open Coverage. If the text exists in the DOCX but not in any chunk, correct the chunk coverage. If it is absent from the DOCX, address PDF-to-DOCX extraction first.",
-    ),
-    "content": (
-        "Compare chunk text with its source",
-        "Compare the cited source and chunk excerpts. Correct only demonstrated changes to facts, numbers, conditions, negation, or meaning.",
-    ),
-    "section": (
-        "Review section paths and heading coverage",
-        "Compare the chunk path with the DOCX headings and source excerpt. Keep adjacent related subsections together when they remain coherent; change paths or boundaries only when the evidence shows a meaningful mismatch or missing section.",
-    ),
-    "boundary": (
-        "Review chunk boundaries for meaning",
-        "Check the cited chunk edge and nearby source context. Split or combine content only when a sentence, condition, definition, or related idea has been separated in a way that harms understanding or retrieval.",
-    ),
-    "size": (
-        "Review chunk size",
-        "Compare the chunk with the configured size limit. Adjust only chunks that exceed the supplied limit or are too small to carry useful context.",
-    ),
-    "context": (
-        "Supply the missing context",
-        "Check whether the definition, reference, table/figure caption, or neighboring chunk is available. Add or link the needed context only when the source supports it.",
-    ),
-    "traceability": (
-        "Repair chunk identifiers or traceability",
-        "Check the affected chunk IDs, section paths, page references, sequence, and required metadata against the supplied source and configuration.",
-    ),
-    "evidence": (
-        "Resolve checks that lack enough evidence",
-        "Compare the cited source and chunk excerpts, provide relevant neighboring context or entity information, and configure the on-prem LLM for contextual checks if it is available. Do not treat an inconclusive result as a proven defect.",
-    ),
-    "upstream": (
-        "Check possible PDF-to-DOCX omissions",
-        "Review the listed PDF text against the DOCX. If it is missing from the DOCX, fix or review PDFLens conversion; changing chunk boundaries cannot restore text that never reached the DOCX.",
-    ),
+    "coverage": ("Check source text coverage", "Use Coverage to compare DOCX passages with chunks. Add missing DOCX text to the appropriate chunk. If it is absent from the DOCX, review PDFLens conversion first."),
+    "content": ("Verify content against the source", "Compare the cited source and chunk excerpts. Correct only evidence-backed changes to facts, numbers, conditions, negation, or meaning."),
+    "layout": ("Review section assignment and chunk boundaries", "Compare section paths and chunk excerpts with DOCX headings. Keep adjacent related subsections together when coherent; change paths or boundaries only for a demonstrated mismatch or loss of meaning."),
+    "traceability": ("Fix chunk IDs or section paths", "Check the cited chunk IDs and section paths against the supplied DOCX and chunk file."),
 }
 
 
@@ -47,87 +16,87 @@ def _action_key(finding: dict[str, Any]) -> str:
     criterion = str(finding.get("criterion_id") or "")
     if criterion in {"C01", "C03"}:
         return "coverage"
-    if criterion in {"C02", "C04", "C05", "C06", "C07"}:
+    if criterion in {"C02", "C05", "C06"}:
         return "content"
-    if criterion.startswith("S"):
-        return "section"
-    if criterion == "B04":
-        return "size"
-    if criterion.startswith("B"):
-        return "boundary"
-    if criterion.startswith(("K", "E")):
-        return "context"
-    if criterion.startswith("T"):
-        return "traceability"
-    if criterion.startswith("M"):
-        return "boundary"
-    return "evidence"
+    if criterion.startswith(("S", "M", "B")):
+        return "layout"
+    return "traceability"
 
 
-def build_action_plan(
-    gate: str,
-    findings: list[dict[str, Any]],
-    unmatched_docx_units: list[dict[str, Any]],
-    upstream_issues: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Turn evaluator results into concise, evidence-linked next steps."""
-    if gate == "PASS":
-        summary = "The checks meet the current provisional thresholds. Review any unresolved items below before accepting the result."
-    elif gate == "FAIL":
-        summary = "The quality gate failed. Start with high-priority findings, then re-run the judge after corrections."
-    elif gate == "REVIEW_REQUIRED":
-        summary = "Human review is needed. Some checks failed or lack enough evidence; an inconclusive result is not proof of a defect."
-    else:
-        summary = "The judge could not score enough criteria to make a quality decision. Check the inputs and available evidence."
+def _action(priority: str, title: str, instruction: str, findings: list[dict[str, Any]], source_refs: list[str] | None = None) -> dict[str, Any]:
+    chunk_ids = sorted({item.get("chunk_id") for item in findings if item.get("chunk_id")})
+    refs = sorted({ref for item in findings for ref in item.get("source_evidence_refs", [])})
+    refs.extend(ref for ref in (source_refs or []) if ref and ref not in refs)
+    return {
+        "priority": priority, "title": title, "what_to_do": instruction,
+        "finding_count": len(findings),
+        "finding_ids": [item.get("finding_id") for item in findings if item.get("finding_id")][:8],
+        "criterion_ids": sorted({item.get("criterion_id") for item in findings if item.get("criterion_id")}),
+        "affected_chunk_count": len(chunk_ids), "chunk_ids": chunk_ids[:3],
+        "more_chunk_ids_count": max(0, len(chunk_ids) - 3),
+        "source_refs": refs[:5], "more_source_refs_count": max(0, len(refs) - 5),
+    }
 
+
+def build_action_plan(gate: str, findings: list[dict[str, Any]], unmatched_docx_units: list[dict[str, Any]],
+                      upstream_issues: list[dict[str, Any]], *, llm_info: dict[str, Any] | None = None,
+                      overall_score: float | None = None, review_boundary: float | None = None) -> dict[str, Any]:
+    """Summarize primary-scorecard issues as a short set of evidence-linked next steps."""
+    llm_info = llm_info or {}
+    unresolved_llm = [item for item in findings if item.get("criterion_id") in _SCORE_CRITERIA
+                      and item.get("outcome") == "INCONCLUSIVE"]
+    primary = [item for item in findings if item.get("criterion_id") in _SCORE_CRITERIA
+               and item.get("outcome") == "FAIL"]
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for finding in findings:
-        if finding.get("outcome") in {"FAIL", "INCONCLUSIVE"}:
-            grouped[_action_key(finding)].append(finding)
-
-    actions: list[dict[str, Any]] = []
+    for item in primary:
+        grouped[_action_key(item)].append(item)
+    actions = []
     for key, related in grouped.items():
         title, instruction = _ACTIONS[key]
         failures = [item for item in related if item.get("outcome") == "FAIL"]
-        severities = {str(item.get("severity") or "").upper() for item in failures}
-        if "CRITICAL" in severities or "HIGH" in severities:
-            priority = "High"
-        elif failures:
-            priority = "Medium"
-        else:
-            priority = "Review"
-        actions.append({
-            "priority": priority,
-            "title": title,
-            "what_to_do": instruction,
-            "finding_ids": [item.get("finding_id") for item in related if item.get("finding_id")],
-            "criterion_ids": sorted({item.get("criterion_id") for item in related if item.get("criterion_id")}),
-            "chunk_ids": sorted({item.get("chunk_id") for item in related if item.get("chunk_id")}),
-            "source_refs": sorted({ref for item in related for ref in item.get("source_evidence_refs", [])}),
-        })
-
-    if unmatched_docx_units:
-        actions.append({
-            "priority": "High" if any(item.get("supported_by_pdf") for item in unmatched_docx_units) else "Review",
-            "title": "Check DOCX source text not represented in chunks",
-            "what_to_do": "Use Coverage to compare each unmatched DOCX passage with the chunk set. Add it to the appropriate chunk if it belongs there; if the DOCX passage itself is incorrect or incomplete, review PDFLens conversion first.",
-            "finding_ids": [],
-            "criterion_ids": ["C03"],
-            "chunk_ids": [],
-            "source_refs": [item.get("source_ref") for item in unmatched_docx_units[:30]],
-        })
+        priority = "High" if any(item.get("severity") in {"CRITICAL", "HIGH"} for item in failures) else ("Medium" if failures else "Review")
+        refs = [item.get("source_ref") for item in unmatched_docx_units] if key == "coverage" else []
+        actions.append(_action(priority, title, instruction, related, refs))
     if upstream_issues:
-        actions.append({
-            "priority": "High",
-            "title": _ACTIONS["upstream"][0],
-            "what_to_do": _ACTIONS["upstream"][1],
-            "finding_ids": [],
-            "criterion_ids": ["C03"],
-            "chunk_ids": [],
-            "source_refs": [item.get("source_ref") for item in upstream_issues[:30]],
-            "pages": sorted({item.get("page_number") for item in upstream_issues if item.get("page_number")}),
-        })
-
-    priority_rank = {"High": 0, "Medium": 1, "Review": 2}
-    actions.sort(key=lambda item: (priority_rank[item["priority"]], item["title"]))
+        refs = [item.get("source_ref") for item in upstream_issues]
+        issue = {"criterion_id": "C03", "outcome": "FAIL", "severity": "HIGH", "source_evidence_refs": refs}
+        action = _action("High", "Check possible PDF-to-DOCX omissions",
+                         "Compare the listed PDF passages with the DOCX. If text is missing from the DOCX, review PDFLens conversion before changing chunk boundaries.", [issue], refs)
+        action["pages"] = sorted({item.get("page_number") for item in upstream_issues if item.get("page_number")})
+        actions.append(action)
+    if unresolved_llm:
+        if not llm_info.get("configured"):
+            instruction = "Configure the LiteLLM URL, model alias, and key, then rerun. These checks were not evaluated and are not failures."
+            title = "Configure LiteLLM to score the criteria"
+        elif llm_info.get("failed_chunk_calls"):
+            instruction = (f"LiteLLM settings are present, but {llm_info['failed_chunk_calls']} chunk calls failed. "
+                           "Check the server log for the HTTP or response-format error, then verify the proxy URL, model alias, key, and JSON mode before rerunning.")
+            title = "Fix failed LiteLLM calls"
+        elif llm_info.get("chunks_without_source_evidence"):
+            instruction = (f"{llm_info['chunks_without_source_evidence']} chunks had no sufficiently aligned DOCX passage. "
+                           "Confirm the uploaded ZIP contains the DOCX used to create this chunk JSON, then review the listed source/chunk evidence and rerun.")
+            title = "Check DOCX-to-chunk alignment"
+        else:
+            instruction = ("The model responded, but some criterion results were inconclusive or failed reference validation. "
+                           "Open Scored evidence and review the reason and cited passages for each check before changing the chunks.")
+            title = "Review inconclusive LLM results"
+        actions.append({"priority": "Review", "title": title, "what_to_do": instruction,
+                        "finding_count": len(unresolved_llm), "finding_ids": [],
+                        "criterion_ids": sorted({item.get("criterion_id") for item in unresolved_llm if item.get("criterion_id")}),
+                        "affected_chunk_count": len({item.get("chunk_id") for item in unresolved_llm if item.get("chunk_id")}),
+                        "chunk_ids": sorted({item.get("chunk_id") for item in unresolved_llm if item.get("chunk_id")})[:3],
+                        "more_chunk_ids_count": max(0, len({item.get("chunk_id") for item in unresolved_llm if item.get("chunk_id")}) - 3),
+                        "source_refs": [], "more_source_refs_count": 0})
+    if gate == "FAIL" and overall_score is not None and review_boundary is not None:
+        summary = f"Needs correction: the criteria score is {overall_score:.1f}%, below the {review_boundary:.0f}% minimum review threshold. See the cited C02, C06, S01, M01, or B03 findings."
+    elif gate == "FAIL":
+        summary = "Needs correction: one or more scored criteria failed. Review the cited evidence and rerun the judge."
+    elif gate == "REVIEW_REQUIRED":
+        summary = "Needs review: the score is in the review band or some criteria could not be assessed. Unresolved checks are not counted as failures."
+    elif gate == "PASS":
+        summary = "Meets the current score threshold: all scored LLM criteria have enough evidence and the score is at or above the pass threshold."
+    else:
+        summary = "No criteria score is available. Check that the DOCX, chunks, and LiteLLM configuration were supplied."
+    rank = {"High": 0, "Medium": 1, "Review": 2}
+    actions.sort(key=lambda item: (rank[item["priority"]], item["title"]))
     return {"summary": summary, "actions": actions}

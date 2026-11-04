@@ -4,3 +4,8 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 data/
+
+# Local configuration can contain LiteLLM credentials.
+.env
+.env.*
+!.env.example
