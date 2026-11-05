@@ -3,27 +3,27 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-# Five LLM-judged sectionwise criteria; deterministic checks remain diagnostics.
+# Five human-readable questions used to review section-wise chunks.
 _SCORE_DIMENSIONS = {
-    "Source accuracy": (
+    "Meaning preserved": (
         {"C02"},
-        "LLM compares chunk claims with the supplied DOCX source passages.",
+        "Does the chunk preserve the source's facts, numbers, conditions, exceptions, and meaning?",
     ),
-    "Conditions and negation": (
-        {"C06"},
-        "LLM checks that conditions, exceptions, negation, and obligation strength retain their source meaning.",
-    ),
-    "Section assignment": (
+    "Right heading": (
         {"S01"},
-        "LLM checks whether the chunk's section path fits its content and DOCX section context.",
+        "Does the section path match the source heading and the chunk's subject?",
     ),
-    "Topic coherence": (
+    "One subject": (
         {"M01"},
-        "LLM checks whether the chunk contains one coherent topic or a closely related group of points.",
+        "Does the chunk stay on one topic or a closely related group of points?",
     ),
-    "Chunk boundaries": (
+    "Natural boundaries": (
         {"B03"},
-        "LLM checks whether related concepts stay together and unrelated material is not combined in a harmful way.",
+        "Does the chunk start and end without breaking a sentence or separating a necessary idea?",
+    ),
+    "Enough context": (
+        {"K05"},
+        "Can a reader understand the chunk using its heading and included text?",
     ),
 }
 
@@ -41,12 +41,12 @@ def _score(findings: list[dict[str, Any]]) -> dict[str, Any]:
         "scorable_count": total,
         "score_points": score_points,
         "max_points": total,
-        "pass_percentage": round(100 * (score_points + total) / (2 * total), 2) if total else None,
+        "pass_percentage": round(100 * passed / total, 2) if total else None,
     }
 
 
 def build_scorecard(findings: list[dict[str, Any]], *, include_document: bool = True) -> dict[str, Any]:
-    """Summarize findings into a few auditable, non-overlapping quality dimensions."""
+    """Summarize findings using five reviewer-friendly chunk questions."""
     dimensions = []
     core_findings = []
     for name, (criterion_ids, description) in _SCORE_DIMENSIONS.items():

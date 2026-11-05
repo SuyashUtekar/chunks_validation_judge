@@ -33,7 +33,16 @@ _CRITERIA_BY_ID = {
 }
 _OUTCOMES = {"PASS", "FAIL", "N/A", "INCONCLUSIVE"}
 _SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
-_LLM_IDS = {"C02", "C06", "S01", "M01", "B03"}  # The only criteria that contribute to the sectionwise score.
+_LLM_IDS = {"C02", "S01", "M01", "B03", "K05"}  # The five human-facing chunk review questions.
+_LLM_CRITERIA_ORDER = [item["id"] for item in _CRITERIA["criteria"] if item["id"] in _LLM_IDS]
+_REVIEW_ACTIONS = {
+    "KEEP_AS_IS", "EDIT_CHUNK_TEXT", "MOVE_TO_SECTION", "SPLIT_CHUNK",
+    "ADJUST_BOUNDARY", "ADD_CONTEXT", "CHECK_SOURCE", "CHECK_PDFLENS", "NOT_APPLICABLE",
+}
+_DEFAULT_ACTIONS = {
+    "C02": "EDIT_CHUNK_TEXT", "S01": "MOVE_TO_SECTION", "M01": "SPLIT_CHUNK",
+    "B03": "ADJUST_BOUNDARY", "K05": "ADD_CONTEXT",
+}
 _STOPWORDS = set("a an and are as at be by for from in into is it of on or that the this to was were with".split())
 _TOKEN_RE = re.compile(r"[\w]+(?:[.,:/%-][\w]+)*", re.UNICODE)
 _NUMBER_RE = re.compile(r"(?<!\w)(?:\d{1,4}[-/.]){1,2}\d{1,4}|\d[\d,]*(?:\.\d+)?\s*%?", re.UNICODE)
@@ -148,7 +157,8 @@ def _finding(criterion_id: str, outcome: str, explanation: str, *, chunk: dict[s
              source_refs: list[str] | None = None, chunk_refs: list[str] | None = None,
              source_excerpt: str = "", chunk_excerpt: str = "", severity: str | None = None,
              confidence: float | None = None, human_review: bool = False,
-             scope: str | None = None) -> dict[str, Any]:
+             scope: str | None = None, improvement: str = "",
+             suggested_action: str = "") -> dict[str, Any]:
     criterion = _CRITERIA_BY_ID[criterion_id]
     return {
         "finding_id": "",
@@ -163,8 +173,10 @@ def _finding(criterion_id: str, outcome: str, explanation: str, *, chunk: dict[s
         "explanation": explanation,
         "source_evidence_refs": source_refs or [],
         "chunk_evidence_refs": chunk_refs or ([f"chunk:{chunk['chunk_id']}:content"] if chunk else []),
-        "source_excerpt": _truncate(source_excerpt),
-        "chunk_excerpt": _truncate(chunk_excerpt or (chunk["content"] if chunk else "")),
+        "source_excerpt": _truncate(source_excerpt, 1200),
+        "chunk_excerpt": _truncate(chunk_excerpt or (chunk["content"] if chunk else ""), 1600),
+        "improvement": _truncate(improvement, 500),
+        "suggested_action": suggested_action,
         "confidence": confidence,
         "human_review_required": human_review,
         "method": criterion["method"],
@@ -183,7 +195,7 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
     except LLMUnavailableError as exc:
         logger.error("llm_judge_unavailable evaluation_id=%s reason=%s", evaluation_id, exc)
         for chunk in chunks:
-            for criterion_id in sorted(_LLM_IDS):
+            for criterion_id in _LLM_CRITERIA_ORDER:
                 if criterion_id == "K03" and not _VISUAL_TAG_RE.search(chunk["content"]):
                     findings.append(_finding(criterion_id, "N/A", "Chunk contains no table/image tag.", chunk=chunk))
                 elif criterion_id in {"E03", "E04"} and not chunk.get("entities") and not config.get("entity_map"):
@@ -194,6 +206,7 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
         return {"configured": False, "provider": None, "model": None,
                 "calls_attempted": 0, "calls_succeeded": 0, "failed_chunk_calls": 0,
                 "chunks_without_source_evidence": 0, "invalid_criterion_results": 0,
+                "could_not_evaluate_chunk_ids": [chunk["chunk_id"] for chunk in chunks],
                 "note": "LLM criteria could not be evaluated because the endpoint is not configured."}
 
     llm_errors = 0
@@ -201,13 +214,14 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
     calls_succeeded = 0
     chunks_without_evidence = 0
     invalid_criterion_results = 0
+    could_not_evaluate_chunk_ids: list[str] = []
     prepared: list[dict[str, Any]] = []
     for chunk in chunks:
         candidates = matches.get(chunk["chunk_id"], [])
         evidence_units = [candidate["unit"] for candidate in candidates[:3] if candidate["score"] >= 0.18]
         refs = [unit["unit_id"] for unit in evidence_units]
         chunk_ref = f"chunk:{chunk['chunk_id']}:content"
-        relevant_ids = sorted(_LLM_IDS)
+        relevant_ids = list(_LLM_CRITERIA_ORDER)
         if not chunk.get("entities") and not config.get("entity_map"):
             relevant_ids = [criterion_id for criterion_id in relevant_ids if criterion_id not in {"E03", "E04"}]
         local_findings: list[dict[str, Any]] = []
@@ -281,6 +295,7 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
         response, error = next(call_results)
         if error:
             llm_errors += 1
+            could_not_evaluate_chunk_ids.append(chunk["chunk_id"])
             logger.error("llm_chunk_evaluation_failed evaluation_id=%s chunk_id=%s reason=%s",
                          evaluation_id, chunk["chunk_id"], error)
             for cid in relevant_ids:
@@ -300,9 +315,11 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
             chunk_refs = result_item.get("chunk_evidence_refs", [])
             if not isinstance(source_refs, list) or not isinstance(chunk_refs, list):
                 continue
+            if not all(isinstance(ref, str) for ref in [*source_refs, *chunk_refs]):
+                continue
             if any(ref not in refs for ref in source_refs) or any(ref != chunk_ref for ref in chunk_refs):
                 continue
-            if outcome == "FAIL" and (not source_refs or not chunk_refs):
+            if outcome in {"PASS", "FAIL"} and (not source_refs or chunk_ref not in chunk_refs):
                 outcome = "INCONCLUSIVE"
             severity = result_item.get("severity")
             if severity not in _SEVERITIES:
@@ -311,12 +328,30 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
                 confidence = max(0.0, min(1.0, float(result_item.get("confidence"))))
             except (TypeError, ValueError):
                 confidence = None
+            improvement = str(result_item.get("improvement") or "").strip()
+            suggested_action = str(result_item.get("suggested_action") or "").strip().upper()
+            if outcome == "PASS":
+                suggested_action = "KEEP_AS_IS"
+                improvement = ""
+            elif outcome == "INCONCLUSIVE":
+                suggested_action = "CHECK_SOURCE"
+                improvement = improvement or "Verify that the cited source passage is the correct comparison before changing this chunk."
+            else:
+                if suggested_action not in _REVIEW_ACTIONS or suggested_action in {"KEEP_AS_IS", "NOT_APPLICABLE"}:
+                    suggested_action = _DEFAULT_ACTIONS.get(cid, "CHECK_SOURCE")
+                improvement = improvement or "Compare the cited text and correct only the demonstrated mismatch."
+            cited_source_excerpt = "\n".join(
+                f"[{unit['unit_id']}] {unit['text']}"
+                for unit in evidence_units if unit["unit_id"] in source_refs
+            )
             findings.append(_finding(
                 cid, outcome, _truncate(str(result_item.get("explanation") or "No explanation supplied."), 1000),
                 chunk=chunk, source_refs=source_refs, chunk_refs=chunk_refs,
-                source_excerpt=evidence_units[0]["text"], chunk_excerpt=chunk["content"],
+                source_excerpt=cited_source_excerpt, chunk_excerpt=chunk["content"],
                 severity=severity, confidence=confidence,
-                human_review=bool(result_item.get("human_review_required", outcome in {"FAIL", "INCONCLUSIVE"})),
+                human_review=(outcome == "INCONCLUSIVE" or
+                              bool(result_item.get("human_review_required", outcome == "FAIL"))),
+                improvement=improvement, suggested_action=suggested_action,
             ))
             returned[cid] = True
         invalid_count = len(relevant_ids) - len(returned)
@@ -342,8 +377,117 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
             "calls_succeeded": calls_succeeded, "failed_chunk_calls": llm_errors,
             "chunks_without_source_evidence": chunks_without_evidence,
             "invalid_criterion_results": invalid_criterion_results,
+            "could_not_evaluate_chunk_ids": could_not_evaluate_chunk_ids,
             "parallel_workers": worker_count,
-            "prompt_version": "chunk_judge_v4"}
+            "prompt_version": "chunk_judge_v5"}
+
+
+def _build_chunk_reviews(chunks: list[dict[str, Any]], findings: list[dict[str, Any]],
+                         llm_info: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Create one plain-language, evidence-backed reviewer result for every chunk."""
+    reviews = []
+    for chunk in chunks:
+        current = [item for item in findings if item.get("chunk_id") == chunk["chunk_id"]
+                   and item.get("criterion_id") in _LLM_IDS and item.get("method") == "llm"]
+        call_failed = (not llm_info.get("configured")
+                       or chunk["chunk_id"] in llm_info.get("could_not_evaluate_chunk_ids", []))
+        failed = [item for item in current if item["outcome"] == "FAIL"]
+        unresolved = [item for item in current if item["outcome"] == "INCONCLUSIVE"] if not call_failed else []
+        passed = [item for item in current if item["outcome"] == "PASS"]
+        not_applicable = [item for item in current if item["outcome"] == "N/A"]
+        if call_failed:
+            verdict = "Could not evaluate"
+            summary = "The judge did not complete this chunk's review. Check the LiteLLM error and rerun the evaluation."
+            action = "RETRY_EVALUATION"
+        elif failed:
+            verdict, summary = "Needs a fix", failed[0]["explanation"]
+            action = failed[0].get("suggested_action") or _DEFAULT_ACTIONS.get(failed[0]["criterion_id"], "CHECK_SOURCE")
+        elif unresolved:
+            verdict, summary, action = "Check against source", unresolved[0]["explanation"], "CHECK_SOURCE"
+        elif current and len(passed) + len(not_applicable) == len(_LLM_IDS):
+            verdict, summary, action = "Looks good", "No clear chunking issue was found in the supplied DOCX evidence.", "KEEP_AS_IS"
+        else:
+            verdict, summary, action = "Could not evaluate", "The judge did not produce a complete result for this chunk. Check LiteLLM and rerun.", "CHECK_SOURCE"
+
+        def _review_item(item: dict[str, Any]) -> dict[str, Any]:
+            if item.get("outcome") == "INCONCLUSIVE":
+                improvement = item.get("improvement") or "Verify that the cited passage is the correct source for this chunk."
+            elif item.get("outcome") == "FAIL":
+                improvement = item.get("improvement") or "Compare the cited texts and correct only the demonstrated mismatch."
+            else:
+                improvement = item.get("improvement") or ""
+            return {
+                "criterion": item.get("criterion"),
+                "explanation": item.get("explanation"),
+                "improvement": improvement,
+                "source_refs": item.get("source_evidence_refs", []),
+                "source_excerpt": item.get("source_excerpt", ""),
+                "chunk_excerpt": item.get("chunk_excerpt", ""),
+            }
+
+        criteria = [{
+            "criterion": item.get("criterion"),
+            "result": {"PASS": "Looks good", "FAIL": "Needs a fix",
+                       "INCONCLUSIVE": "Could not evaluate" if call_failed else "Check against source",
+                       "N/A": "Not applicable"}.get(
+                           item.get("outcome"), "Could not evaluate"),
+            "explanation": item.get("explanation"),
+        } for item in current]
+        reviews.append({
+            "chunk_id": chunk["chunk_id"],
+            "sequence_number": chunk.get("sequence_number") or chunk.get("row_number"),
+            "section_path": chunk.get("section_path", []),
+            "page_numbers": chunk.get("page_numbers", []),
+            "verdict": verdict,
+            "summary": summary,
+            "strengths": [_review_item(item) for item in passed[:3]],
+            "problems": [_review_item(item) for item in failed],
+            "checks_to_verify": [_review_item(item) for item in unresolved],
+            "could_not_evaluate": [_review_item(item) for item in current if call_failed and item["outcome"] == "INCONCLUSIVE"],
+            "improvements": list(dict.fromkeys(
+                item.get("improvement", "") for item in [*failed, *unresolved]
+                if item.get("improvement")
+            )) or (["No change recommended based on the available evidence."] if verdict == "Looks good"
+                   else (["Retry this evaluation after fixing the judge connection or response error."] if call_failed else [])),
+            "recommended_action": action,
+            "chunk_text": str(chunk.get("content") or "")[:8000],
+            "criteria": criteria,
+        })
+
+    # Each chunk contributes to exactly one headline bucket: its displayed verdict.
+    failed_ids = {item["chunk_id"] for item in reviews if item["verdict"] == "Needs a fix"}
+    unresolved_ids = {item["chunk_id"] for item in reviews if item["verdict"] == "Check against source"}
+    good_ids = {item["chunk_id"] for item in reviews if item["verdict"] == "Looks good"}
+    not_evaluated_ids = {item["chunk_id"] for item in reviews if item["verdict"] == "Could not evaluate"}
+    if failed_ids:
+        decision = "Fixes needed"
+        message = f"{len(failed_ids)} chunk(s) have an evidence-backed issue. Review those chunks first."
+        if unresolved_ids:
+            message += f" {len(unresolved_ids)} other chunk(s) need source verification."
+        if not_evaluated_ids:
+            message += f" The judge could not complete {len(not_evaluated_ids)} other chunk review(s)."
+    elif not_evaluated_ids:
+        decision, message = "Could not evaluate", f"The judge did not complete {len(not_evaluated_ids)} chunk review(s). Fix the judge error and rerun."
+        if unresolved_ids:
+            message += f" {len(unresolved_ids)} other chunk(s) need a source check."
+    elif unresolved_ids:
+        decision, message = "Check against source", f"{len(unresolved_ids)} chunk(s) need a source check before they can be cleared."
+    elif reviews and len(good_ids) == len(reviews):
+        decision, message = "Looks good", "No clear chunking issue was found in the evaluated chunks."
+    else:
+        decision, message = "Could not evaluate", "Some chunks did not receive a complete result. Check LiteLLM and source alignment."
+    summary = {
+        "decision": decision,
+        "message": message,
+        "total_chunks": len(reviews),
+        "chunks_needing_correction": len(failed_ids),
+        "chunks_needing_source_review": len(unresolved_ids),
+        "chunks_looks_good": len(good_ids),
+        "chunks_not_evaluated": len(not_evaluated_ids),
+        "chunks_with_no_flagged_issue": len(good_ids),
+        "issues_to_review": sum(len(item["problems"]) + len(item["checks_to_verify"]) + len(item["could_not_evaluate"]) for item in reviews),
+    }
+    return reviews, summary
 
 
 def _criterion_score(findings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -752,6 +896,7 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
                              human_review=s05 == "INCONCLUSIVE", scope="document"))
 
     llm_info = _add_llm_findings(chunks, matches, findings, config, evaluation_id)
+    chunk_reviews, review_summary = _build_chunk_reviews(chunks, findings, llm_info)
     for index, finding in enumerate(findings, start=1):
         finding["finding_id"] = f"finding-{index:07d}"
 
@@ -883,6 +1028,8 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
         "source_kind_for_alignment": source_kind,
         "summary": summary,
         "scorecard": scorecard,
+        "review_summary": review_summary,
+        "chunk_reviews": chunk_reviews,
         "action_plan": build_action_plan(
             gate, findings, missing_units, upstream_issues, llm_info=llm_info,
             overall_score=pass_pct, review_boundary=thresholds["review_required_below"],

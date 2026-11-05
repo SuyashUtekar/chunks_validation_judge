@@ -88,7 +88,7 @@ class OpenAICompatibleJudge:
         finish_reason = None
         logger.info("llm_call_started evaluation_id=%s chunk_id=%s model=%s criteria=%s",
                     evaluation_id, chunk_id, self.model, ",".join(criterion_ids))
-        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "chunk_judge_v4.txt"
+        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "chunk_judge_v5.txt"
         system_prompt = prompt_path.read_text(encoding="utf-8")
         headers = {"Content-Type": "application/json"}
         if settings.llm_api_key:

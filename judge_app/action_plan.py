@@ -3,11 +3,12 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-_SCORE_CRITERIA = {"C02", "C06", "S01", "M01", "B03"}
+_SCORE_CRITERIA = {"C02", "S01", "M01", "B03", "K05"}
 _ACTIONS = {
     "coverage": ("Check source text coverage", "Use Coverage to compare DOCX passages with chunks. Add missing DOCX text to the appropriate chunk. If it is absent from the DOCX, review PDFLens conversion first."),
     "content": ("Verify content against the source", "Compare the cited source and chunk excerpts. Correct only evidence-backed changes to facts, numbers, conditions, negation, or meaning."),
     "layout": ("Review section assignment and chunk boundaries", "Compare section paths and chunk excerpts with DOCX headings. Keep adjacent related subsections together when coherent; change paths or boundaries only for a demonstrated mismatch or loss of meaning."),
+    "context": ("Check the context", "Use the cited source passage and section path to see whether the chunk has enough context. Add context only when the DOCX supports it."),
     "traceability": ("Fix chunk IDs or section paths", "Check the cited chunk IDs and section paths against the supplied DOCX and chunk file."),
 }
 
@@ -16,8 +17,10 @@ def _action_key(finding: dict[str, Any]) -> str:
     criterion = str(finding.get("criterion_id") or "")
     if criterion in {"C01", "C03"}:
         return "coverage"
-    if criterion in {"C02", "C05", "C06"}:
+    if criterion in {"C02", "C05"}:
         return "content"
+    if criterion == "K05":
+        return "context"
     if criterion.startswith(("S", "M", "B")):
         return "layout"
     return "traceability"
@@ -88,7 +91,7 @@ def build_action_plan(gate: str, findings: list[dict[str, Any]], unmatched_docx_
                         "more_chunk_ids_count": max(0, len({item.get("chunk_id") for item in unresolved_llm if item.get("chunk_id")}) - 3),
                         "source_refs": [], "more_source_refs_count": 0})
     if gate == "FAIL" and overall_score is not None and review_boundary is not None:
-        summary = f"Needs correction: the criteria score is {overall_score:.1f}%, below the {review_boundary:.0f}% minimum review threshold. See the cited C02, C06, S01, M01, or B03 findings."
+        summary = f"Needs correction: the criteria score is {overall_score:.1f}%, below the {review_boundary:.0f}% minimum review threshold. See the cited source and chunk comparisons in the review queue."
     elif gate == "FAIL":
         summary = "Needs correction: one or more scored criteria failed. Review the cited evidence and rerun the judge."
     elif gate == "REVIEW_REQUIRED":

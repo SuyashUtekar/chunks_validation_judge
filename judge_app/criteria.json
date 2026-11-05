@@ -1,38 +1,38 @@
 {
-  "criteria_version": "proposed-4.2-llm-points-sectionwise",
+  "criteria_version": "human-review-5.0-sectionwise",
   "criteria": [
     {
       "id": "C02",
-      "category": "Content integrity",
-      "name": "Content accuracy",
-      "scope": "chunk",
-      "method": "llm"
-    },
-    {
-      "id": "C06",
-      "category": "Content integrity",
-      "name": "Negation and condition preservation",
+      "category": "Source match",
+      "name": "Does it preserve the source's meaning?",
       "scope": "chunk",
       "method": "llm"
     },
     {
       "id": "S01",
-      "category": "Section association",
-      "name": "Correct section assignment",
+      "category": "Section match",
+      "name": "Is it under the right heading?",
       "scope": "chunk",
       "method": "llm"
     },
     {
       "id": "M01",
-      "category": "Semantic coherence",
-      "name": "Single-topic coherence",
+      "category": "Topic unity",
+      "name": "Does it stay on one subject?",
       "scope": "chunk",
       "method": "llm"
     },
     {
       "id": "B03",
-      "category": "Boundaries and segmentation",
-      "name": "Concept boundary integrity",
+      "category": "Chunk boundaries",
+      "name": "Does it begin and end naturally?",
+      "scope": "chunk",
+      "method": "llm"
+    },
+    {
+      "id": "K05",
+      "category": "Context",
+      "name": "Can someone understand it in context?",
       "scope": "chunk",
       "method": "llm"
     }
