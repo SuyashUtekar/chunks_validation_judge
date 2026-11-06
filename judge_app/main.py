@@ -53,7 +53,7 @@ def health() -> dict[str, str]:
 async def create_evaluation(
     pdflens_package: UploadFile = File(...),
     source_pdf: UploadFile = File(...),
-    chunking_config: str = Form('{"max_words":800,"overlap_words":80}'),
+    chunking_config: str = Form("{}"),
 ) -> JSONResponse:
     package_limit = settings.max_package_bytes + 1
     package_bytes = await pdflens_package.read(package_limit)
@@ -69,20 +69,13 @@ async def create_evaluation(
         if not package.docx_bytes:
             raise InputValidationError("PDFLens ZIP must contain the DOCX used to generate the chunks.")
         config = parse_config(chunking_config)
-        max_words = int(config.get("max_words", 800))
-        overlap_words = int(config.get("overlap_words", 80))
-        if overlap_words >= max_words:
-            raise InputValidationError("overlap_words must be less than max_words for sectionwise chunking.")
         config.setdefault("strategy", "sectionwise")
-        config["max_words"] = max_words
-        config["overlap_words"] = overlap_words
     except InputValidationError as exc:
         raise HTTPException(422, detail={"code": "INVALID_EVALUATION_INPUT", "message": str(exc)}) from exc
 
     try:
         generated_chunks = await run_in_threadpool(
             chunk_docx_bytes, package.docx_bytes, package.docx_name or "document.docx",
-            max_words=max_words, overlap_words=overlap_words,
         )
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "INVALID_EVALUATION_INPUT", "message": str(exc)}) from exc
@@ -91,9 +84,8 @@ async def create_evaluation(
         chunks_bytes = (json.dumps(generated_chunks, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         chunks = normalize_chunks(chunks_bytes, "generated_sectionwise_chunks.json")
         logger.info(
-            "sectionwise_chunks_generated package=%s docx=%s chunks=%s max_words=%s overlap_words=%s",
-            Path(pdflens_package.filename or "package.zip").name, package.docx_name,
-            len(chunks), max_words, overlap_words,
+            "sectionwise_chunks_generated package=%s docx=%s chunks=%s",
+            Path(pdflens_package.filename or "package.zip").name, package.docx_name, len(chunks),
         )
         report = await run_in_threadpool(evaluate, package, chunks, config, sha256(chunks_bytes))
         report["inputs"]["chunks_filename"] = "generated_sectionwise_chunks.json"

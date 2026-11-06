@@ -41,10 +41,10 @@ st.write(
 with st.sidebar:
     st.subheader("Evaluation options")
     config_text = st.text_area(
-        "Chunking configuration (optional JSON)",
-        value='{"max_words": 800, "overlap_words": 80}',
+        "Evaluation options (optional JSON)",
+        value="{}",
         height=190,
-        help="Set sectionwise chunk size and overlap, plus optional evaluation thresholds. The judge generates chunks from the DOCX inside the ZIP.",
+        help="Set optional evaluation thresholds. The sectionwise chunker keeps each detected section whole; it does not apply a word limit or overlap.",
     )
     st.caption(
         "All scored criteria require the configured on-prem LiteLLM endpoint. "
@@ -82,22 +82,15 @@ if run_evaluation:
         if not package.docx_bytes:
             raise InputValidationError("PDFLens ZIP must contain the DOCX used to generate the chunks.")
         config = parse_config(config_text)
-        max_words = int(config.get("max_words", 800))
-        overlap_words = int(config.get("overlap_words", 80))
-        if overlap_words >= max_words:
-            raise InputValidationError("overlap_words must be less than max_words for sectionwise chunking.")
         config.setdefault("strategy", "sectionwise")
-        config["max_words"] = max_words
-        config["overlap_words"] = overlap_words
         generated_chunks = chunk_docx_bytes(
             package.docx_bytes, package.docx_name or "document.docx",
-            max_words=max_words, overlap_words=overlap_words,
         )
         chunks_bytes = (json.dumps(generated_chunks, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         chunks = normalize_chunks(chunks_bytes, "generated_sectionwise_chunks.json")
         logger.info(
-            "sectionwise_chunks_generated package=%s docx=%s chunks=%s max_words=%s overlap_words=%s",
-            Path(package_upload.name).name, package.docx_name, len(chunks), max_words, overlap_words,
+            "sectionwise_chunks_generated package=%s docx=%s chunks=%s",
+            Path(package_upload.name).name, package.docx_name, len(chunks),
         )
         with st.spinner(f"Generated {len(chunks)} chunks. Evaluating against the PDFLens source…"):
             report = evaluate(package, chunks, config, sha256(chunks_bytes))

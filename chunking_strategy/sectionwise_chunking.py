@@ -14,7 +14,6 @@ import re
 import shutil
 import tempfile
 import zipfile
-from bisect import bisect_right
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -118,51 +117,12 @@ def _iter_blocks(document: DocumentType) -> Iterable[tuple[str, str, int | None]
                 yield "table", text, None
 
 
-def _split_words(text: str, max_words: int, overlap_words: int) -> list[str]:
-    """Prefer paragraph and sentence boundaries, then fall back to word limits."""
-    tokens = list(re.finditer(r"\S+", text))
-    if len(tokens) <= max_words:
-        return [text.strip()] if tokens else []
-
-    words = [match.group() for match in tokens]
-    safe_ends = set()
-    for index, word in enumerate(words[:-1]):
-        gap = text[tokens[index].end():tokens[index + 1].start()]
-        if "\n" in gap or re.search(r"[.!?][\"'’”)]*$", word):
-            safe_ends.add(index + 1)
-    safe_ends = sorted(safe_ends)
-    chunks: list[str] = []
-    start = 0
-    while start < len(words):
-        hard_end = min(start + max_words, len(words))
-        end = hard_end
-        if hard_end < len(words):
-            boundary_index = bisect_right(safe_ends, hard_end) - 1
-            if boundary_index >= 0 and safe_ends[boundary_index] > start:
-                end = safe_ends[boundary_index]
-        chunk_start = tokens[start].start()
-        chunk_end = tokens[end - 1].end()
-        chunks.append(text[chunk_start:chunk_end].strip())
-        if end == len(words):
-            break
-        start = max(end - overlap_words, start + 1)
-    return chunks
-
-
 def _chunk_document(
     document: DocumentType,
     source_name: str,
     source_docx: str,
-    *,
-    max_words: int,
-    overlap_words: int,
 ) -> dict[str, object]:
     """Chunk a parsed DOCX using its Word heading hierarchy."""
-    if max_words < 1:
-        raise ValueError("max_words must be at least 1")
-    if overlap_words < 0 or overlap_words >= max_words:
-        raise ValueError("overlap_words must be between 0 and max_words - 1")
-
     title = ""
     sections: list[Section] = []
     active: Section | None = None
@@ -213,77 +173,48 @@ def _chunk_document(
         if not section_text:
             continue
         chunk_prefix = section.path if section.path else ([title] if title else [])
-        prefix_words = len(" ".join(chunk_prefix).split())
-        body_budget = max(1, max_words - prefix_words)
-        for part_number, part in enumerate(
-            _split_words(section_text, max_words=body_budget, overlap_words=min(overlap_words, body_budget - 1)),
-            start=1,
-        ):
-            chunk_parts = [*chunk_prefix, part]
-            chunk_text = " | ".join(value for value in chunk_parts if value)
-            chunks.append(
-                {
-                    "chunk_id": f"chunk-{len(chunks) + 1:06d}",
-                    "document": source_name,
-                    "document_title": title or Path(source_name).stem,
-                    "section_title": section.title,
-                    "section_level": section.level,
-                    "section_path": section.path,
-                    "part": part_number,
-                    "body_text": part,
-                    "text": chunk_text,
-                    "word_count": len(chunk_text.split()),
-                }
-            )
+        chunk_text = " | ".join([*chunk_prefix, section_text])
+        chunks.append(
+            {
+                "chunk_id": f"chunk-{len(chunks) + 1:06d}",
+                "document": source_name,
+                "document_title": title or Path(source_name).stem,
+                "section_title": section.title,
+                "section_level": section.level,
+                "section_path": section.path,
+                "part": 1,
+                "body_text": section_text,
+                "text": chunk_text,
+                "word_count": len(chunk_text.split()),
+            }
+        )
 
     return {
         "source_docx": source_docx,
         "document_title": title or Path(source_name).stem,
         "chunk_count": len(chunks),
-        "max_words": max_words,
-        "overlap_words": overlap_words,
         "chunks": chunks,
     }
 
 
 def chunk_docx(
     source: Path,
-    *,
-    max_words: int = 800,
-    overlap_words: int = 80,
 ) -> dict[str, object]:
     """Read a DOCX path and return chunks grouped by its Word heading hierarchy."""
-    if max_words < 1:
-        raise ValueError("max_words must be at least 1")
-    if overlap_words < 0 or overlap_words >= max_words:
-        raise ValueError("overlap_words must be between 0 and max_words - 1")
     source = Path(source).expanduser().resolve()
-    return _chunk_document(
-        Document(str(source)), source.name, str(source),
-        max_words=max_words, overlap_words=overlap_words,
-    )
+    return _chunk_document(Document(str(source)), source.name, str(source))
 
 
 def chunk_docx_bytes(
     raw: bytes,
     source_name: str = "document.docx",
-    *,
-    max_words: int = 800,
-    overlap_words: int = 80,
 ) -> dict[str, object]:
     """Chunk uploaded DOCX bytes without writing the source document to disk."""
-    if max_words < 1:
-        raise ValueError("max_words must be at least 1")
-    if overlap_words < 0 or overlap_words >= max_words:
-        raise ValueError("overlap_words must be between 0 and max_words - 1")
     try:
         document = Document(BytesIO(raw))
     except Exception as exc:
         raise ValueError("The package DOCX is invalid or unreadable.") from exc
-    return _chunk_document(
-        document, Path(source_name).name, source_name,
-        max_words=max_words, overlap_words=overlap_words,
-    )
+    return _chunk_document(document, Path(source_name).name, source_name)
 
 
 def _find_docx_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
@@ -302,9 +233,6 @@ def _find_docx_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
 
 def chunk_pdflens_zip(
     source_zip: Path,
-    *,
-    max_words: int = 800,
-    overlap_words: int = 80,
 ) -> dict[str, object]:
     """Chunk the single DOCX inside a PDFLens ZIP without extracting the archive."""
     source_zip = source_zip.expanduser().resolve()
@@ -320,9 +248,7 @@ def chunk_pdflens_zip(
                 temporary_docx = Path(temporary_dir) / Path(member.filename).name
                 with archive.open(member) as zipped_docx, temporary_docx.open("wb") as output:
                     shutil.copyfileobj(zipped_docx, output)
-                result = chunk_docx(
-                    temporary_docx, max_words=max_words, overlap_words=overlap_words
-                )
+                result = chunk_docx(temporary_docx)
     except zipfile.BadZipFile as exc:
         raise ValueError(f"Input is not a valid ZIP archive: {source_zip}") from exc
 
@@ -378,10 +304,6 @@ def main() -> None:
     parser.add_argument(
         "--output", "-o", type=Path, help="Output JSON path (defaults beside the DOCX)"
     )
-    parser.add_argument("--max-words", type=int, default=800, help="Maximum words per chunk")
-    parser.add_argument(
-        "--overlap-words", type=int, default=80, help="Words repeated between split chunks"
-    )
     parser.add_argument(
         "--excel-output",
         type=Path,
@@ -399,11 +321,9 @@ def main() -> None:
         f"{source.stem}_chunks.json"
     )
     if source.suffix.lower() == ".zip":
-        result = chunk_pdflens_zip(
-            source, max_words=args.max_words, overlap_words=args.overlap_words
-        )
+        result = chunk_pdflens_zip(source)
     else:
-        result = chunk_docx(source, max_words=args.max_words, overlap_words=args.overlap_words)
+        result = chunk_docx(source)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     excel_output = args.excel_output.expanduser().resolve() if args.excel_output else output.with_suffix(

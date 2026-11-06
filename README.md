@@ -8,14 +8,12 @@ The judge evaluates section-wise chunks against the DOCX supplied to the chunker
 
 - A PDFLens ZIP containing the DOCX used for chunking, plus the original source PDF. The ZIP may also contain `metadata.json`, assets, and the source PDF. If both PDFs are supplied, their SHA-256 hashes must match. If a `manifest.json` exists, listed hashes are checked.
 - The judge generates section-wise chunks from the DOCX inside the ZIP. A chunks JSON/XLSX/CSV upload is no longer required.
-- Optional JSON configuration for `max_words`, `overlap_words`, and evaluation options.
+- Optional JSON configuration for evaluation thresholds and other judge options. The chunker creates one chunk for each detected section, keeps its body together, and does not apply a word target or repeat overlap text.
 
 Example config:
 
 ```json
 {
-  "max_words": 800,
-  "overlap_words": 80,
   "pass_candidate_at": 85,
   "review_required_below": 65
 }
@@ -38,7 +36,7 @@ Open `http://127.0.0.1:8010/docs` for the upload form. Or submit the PDFLens ZIP
 curl -f -X POST http://127.0.0.1:8010/api/v1/chunk-evaluations \
   -F 'pdflens_package=@/path/to/pdflens-output.zip' \
   -F 'source_pdf=@/path/to/original.pdf' \
-  -F 'chunking_config={"max_words":800,"overlap_words":80}'
+  -F 'chunking_config={}'
 ```
 
 The synchronous MVP responds with an evaluation ID and URLs for the JSON report, Excel workbook, and generated chunks JSON. Reports and generated chunks are stored under `data/evaluations/<evaluation_id>/`; uploaded PDF/DOCX files are not persisted. The default storage directory can be changed with `JUDGE_DATA_DIR`.

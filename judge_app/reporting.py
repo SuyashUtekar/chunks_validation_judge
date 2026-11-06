@@ -150,8 +150,6 @@ def compact_report(report: dict[str, Any]) -> dict[str, Any]:
             "chunk_file": report.get("inputs", {}).get("chunks_filename"),
             "chunk_count": summary.get("total_chunks"),
             "strategy": report.get("chunking_strategy"),
-            "max_words": metadata.get("max_words"),
-            "overlap_words": metadata.get("overlap_words"),
         },
         "score_explanation": {
             "meaning": "Only the five chunk review questions determine the rating. PDF-to-DOCX diagnostics are separate.",

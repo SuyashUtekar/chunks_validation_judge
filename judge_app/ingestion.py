@@ -193,7 +193,7 @@ def normalize_chunks(raw: bytes, filename: str) -> list[dict[str, Any]]:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise InputValidationError("Chunk JSON is not valid JSON.") from exc
         if isinstance(payload, dict):
-            file_metadata = {key: payload[key] for key in ("source_docx", "document_title", "document", "chunk_count", "max_words", "overlap_words") if key in payload}
+            file_metadata = {key: payload[key] for key in ("source_docx", "document_title", "document", "chunk_count") if key in payload}
     if not rows:
         raise InputValidationError("Chunk file contains no chunk records.")
     if len(rows) > settings.max_chunks:
@@ -259,16 +259,10 @@ def parse_config(raw: str | None) -> dict[str, Any]:
         raise InputValidationError("Chunking configuration must be valid JSON.") from exc
     if not isinstance(config, dict):
         raise InputValidationError("Chunking configuration must be a JSON object.")
-    for name in ("max_words", "max_characters", "overlap_words"):
-        value = config.get(name)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0
-                                  or (name in {"max_words", "max_characters"} and value == 0)):
-            qualifier = "positive" if name in {"max_words", "max_characters"} else "non-negative"
-            raise InputValidationError(f"Configuration field {name} must be a {qualifier} integer.")
-    if config.get("max_characters") is not None:
-        raise InputValidationError("The judge's sectionwise chunker currently supports max_words, not max_characters.")
-    max_words = config.get("max_words", 800)
-    overlap_words = config.get("overlap_words", 80)
-    if overlap_words >= max_words:
-        raise InputValidationError("overlap_words must be less than max_words for sectionwise chunking.")
+    removed_options = {"max_words", "overlap_words", "max_characters"}.intersection(config)
+    if removed_options:
+        options = ", ".join(sorted(removed_options))
+        raise InputValidationError(
+            f"Sectionwise chunking keeps each detected section intact; remove unsupported size settings: {options}."
+        )
     return config
