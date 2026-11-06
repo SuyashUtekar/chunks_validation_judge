@@ -226,6 +226,7 @@ def normalize_chunks(raw: bytes, filename: str) -> list[dict[str, Any]]:
             "row_number": index,
             "chunk_id": str(chunk_id).strip() if chunk_id is not None else "",
             "content": content_string,
+            "body_text": str(row.get("body_text") or ""),
             "section_path": path,
             "section_id": str(row.get("section_id") or (section.get("section_id") if section else "") or ""),
             "sequence_number": seq_number,
@@ -260,8 +261,14 @@ def parse_config(raw: str | None) -> dict[str, Any]:
         raise InputValidationError("Chunking configuration must be a JSON object.")
     for name in ("max_words", "max_characters", "overlap_words"):
         value = config.get(name)
-        if value is not None and (not isinstance(value, int) or value < 0
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0
                                   or (name in {"max_words", "max_characters"} and value == 0)):
             qualifier = "positive" if name in {"max_words", "max_characters"} else "non-negative"
             raise InputValidationError(f"Configuration field {name} must be a {qualifier} integer.")
+    if config.get("max_characters") is not None:
+        raise InputValidationError("The judge's sectionwise chunker currently supports max_words, not max_characters.")
+    max_words = config.get("max_words", 800)
+    overlap_words = config.get("overlap_words", 80)
+    if overlap_words >= max_words:
+        raise InputValidationError("overlap_words must be less than max_words for sectionwise chunking.")
     return config

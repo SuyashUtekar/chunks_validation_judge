@@ -11,6 +11,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+from chunking_strategy.sectionwise_chunking import chunk_docx_bytes
+
 from .config import settings
 from .evaluation import evaluate
 from .ingestion import InputValidationError, load_pdflens_package, normalize_chunks, parse_config, sha256
@@ -50,32 +52,52 @@ def health() -> dict[str, str]:
 @app.post("/api/v1/chunk-evaluations", status_code=201)
 async def create_evaluation(
     pdflens_package: UploadFile = File(...),
-    chunks_file: UploadFile = File(...),
-    source_pdf: UploadFile | None = File(None),
-    chunking_config: str = Form("{}"),
+    source_pdf: UploadFile = File(...),
+    chunking_config: str = Form('{"max_words":800,"overlap_words":80}'),
 ) -> JSONResponse:
     package_limit = settings.max_package_bytes + 1
-    chunks_limit = settings.max_chunks_bytes + 1
     package_bytes = await pdflens_package.read(package_limit)
-    chunks_bytes = await chunks_file.read(chunks_limit)
-    source_pdf_bytes = await source_pdf.read(settings.max_package_bytes + 1) if source_pdf else None
+    source_pdf_bytes = await source_pdf.read(settings.max_package_bytes + 1)
     if len(package_bytes) >= package_limit:
         raise HTTPException(413, detail={"code": "PACKAGE_TOO_LARGE", "message": "PDFLens package exceeds the configured limit."})
-    if len(chunks_bytes) >= chunks_limit:
-        raise HTTPException(413, detail={"code": "CHUNKS_TOO_LARGE", "message": "Chunk input exceeds the configured limit."})
-    if source_pdf_bytes is not None and len(source_pdf_bytes) > settings.max_package_bytes:
+    if len(source_pdf_bytes) > settings.max_package_bytes:
         raise HTTPException(413, detail={"code": "SOURCE_PDF_TOO_LARGE", "message": "Source PDF exceeds the configured limit."})
     try:
-        package = load_pdflens_package(package_bytes, source_pdf_bytes,
-                                       Path(source_pdf.filename or "source.pdf").name if source_pdf else None)
-        chunks = normalize_chunks(chunks_bytes, chunks_file.filename or "chunks.json")
+        package = load_pdflens_package(
+            package_bytes, source_pdf_bytes, Path(source_pdf.filename or "source.pdf").name,
+        )
+        if not package.docx_bytes:
+            raise InputValidationError("PDFLens ZIP must contain the DOCX used to generate the chunks.")
         config = parse_config(chunking_config)
+        max_words = int(config.get("max_words", 800))
+        overlap_words = int(config.get("overlap_words", 80))
+        if overlap_words >= max_words:
+            raise InputValidationError("overlap_words must be less than max_words for sectionwise chunking.")
+        config.setdefault("strategy", "sectionwise")
+        config["max_words"] = max_words
+        config["overlap_words"] = overlap_words
     except InputValidationError as exc:
         raise HTTPException(422, detail={"code": "INVALID_EVALUATION_INPUT", "message": str(exc)}) from exc
 
     try:
+        generated_chunks = await run_in_threadpool(
+            chunk_docx_bytes, package.docx_bytes, package.docx_name or "document.docx",
+            max_words=max_words, overlap_words=overlap_words,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "INVALID_EVALUATION_INPUT", "message": str(exc)}) from exc
+
+    try:
+        chunks_bytes = (json.dumps(generated_chunks, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        chunks = normalize_chunks(chunks_bytes, "generated_sectionwise_chunks.json")
+        logger.info(
+            "sectionwise_chunks_generated package=%s docx=%s chunks=%s max_words=%s overlap_words=%s",
+            Path(pdflens_package.filename or "package.zip").name, package.docx_name,
+            len(chunks), max_words, overlap_words,
+        )
         report = await run_in_threadpool(evaluate, package, chunks, config, sha256(chunks_bytes))
-        report["inputs"]["chunks_filename"] = Path(chunks_file.filename or "chunks").name
+        report["inputs"]["chunks_filename"] = "generated_sectionwise_chunks.json"
+        report["inputs"]["chunks_generated_by_judge"] = True
         report["inputs"]["pdflens_package_filename"] = Path(pdflens_package.filename or "package.zip").name
         report_json = report_json_bytes(report)
         report_xlsx = await run_in_threadpool(build_report_xlsx, report)
@@ -83,10 +105,15 @@ async def create_evaluation(
         target.mkdir(parents=True, exist_ok=False)
         temporary_json = target / ".report.json.tmp"
         temporary_xlsx = target / ".report.xlsx.tmp"
+        temporary_chunks = target / ".chunks.json.tmp"
         temporary_json.write_bytes(report_json)
         temporary_xlsx.write_bytes(report_xlsx)
+        temporary_chunks.write_bytes(chunks_bytes)
         temporary_json.replace(target / "report.json")
         temporary_xlsx.replace(target / "report.xlsx")
+        temporary_chunks.replace(target / "chunks.json")
+    except InputValidationError as exc:
+        raise HTTPException(422, detail={"code": "INVALID_EVALUATION_INPUT", "message": str(exc)}) from exc
     except HTTPException:
         raise
     except Exception as exc:
@@ -102,6 +129,7 @@ async def create_evaluation(
         "summary": report["summary"],
         "report_url": f"/api/v1/chunk-evaluations/{report['evaluation_id']}/report",
         "workbook_url": f"/api/v1/chunk-evaluations/{report['evaluation_id']}/report.xlsx",
+        "generated_chunks_url": f"/api/v1/chunk-evaluations/{report['evaluation_id']}/chunks.json",
     })
 
 
@@ -126,6 +154,16 @@ def download_report(evaluation_id: str) -> FileResponse:
         raise HTTPException(404, detail={"code": "REPORT_NOT_FOUND", "message": "Workbook not found."})
     return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         filename=f"{evaluation_id}_quality_report.xlsx")
+
+
+@app.get("/api/v1/chunk-evaluations/{evaluation_id}/chunks.json")
+def download_generated_chunks(evaluation_id: str) -> FileResponse:
+    folder = _evaluation_dir(evaluation_id)
+    path = folder / "chunks.json"
+    if not path.is_file():
+        raise HTTPException(404, detail={"code": "CHUNKS_NOT_FOUND", "message": "Generated chunks are unavailable."})
+    return FileResponse(path, media_type="application/json",
+                        filename=f"{evaluation_id}_sectionwise_chunks.json")
 
 
 @app.get("/api/v1/chunk-evaluations/{evaluation_id}/chunks/{chunk_id}")

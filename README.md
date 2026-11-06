@@ -6,22 +6,16 @@ The judge evaluates section-wise chunks against the DOCX supplied to the chunker
 
 ## Inputs
 
-- A PDFLens ZIP containing `document.docx`, `metadata.json`, and any assets, plus the original source PDF. The PDF may be inside the ZIP or uploaded separately; if both are provided, their SHA-256 hashes must match. If a `manifest.json` exists, listed hashes are checked.
-- Chunk records as JSON, XLSX, or CSV. The current sectionwise chunking output is supported:
-  - JSON object containing a `chunks` array with `chunk_id`, `text`, and `section_path`.
-  - XLSX/CSV columns such as `chunk_id`, `chunk_text`.
-- Optional JSON chunking configuration, including strategy, max size, overlap, required metadata fields, entity map, and provisional score thresholds.
+- A PDFLens ZIP containing the DOCX used for chunking, plus the original source PDF. The ZIP may also contain `metadata.json`, assets, and the source PDF. If both PDFs are supplied, their SHA-256 hashes must match. If a `manifest.json` exists, listed hashes are checked.
+- The judge generates section-wise chunks from the DOCX inside the ZIP. A chunks JSON/XLSX/CSV upload is no longer required.
+- Optional JSON configuration for `max_words`, `overlap_words`, and evaluation options.
 
 Example config:
 
 ```json
 {
-  "document_id": "sample-rbi-doc",
-  "chunking_job_id": "run-2026-001",
-  "strategy": "sectionwise",
   "max_words": 800,
   "overlap_words": 80,
-  "required_metadata_fields": [],
   "pass_candidate_at": 85,
   "review_required_below": 65
 }
@@ -38,21 +32,20 @@ uv sync
 uv run uvicorn judge_app.main:app --reload --host 127.0.0.1 --port 8010
 ```
 
-Open `http://127.0.0.1:8010/docs` for the upload form. Or submit the PDFLens ZIP, original PDF (when it is not inside the ZIP), and generated chunks:
+Open `http://127.0.0.1:8010/docs` for the upload form. Or submit the PDFLens ZIP and the original PDF; chunk generation happens inside the judge:
 
 ```sh
 curl -f -X POST http://127.0.0.1:8010/api/v1/chunk-evaluations \
   -F 'pdflens_package=@/path/to/pdflens-output.zip' \
   -F 'source_pdf=@/path/to/original.pdf' \
-  -F 'chunks_file=@/path/to/chunks.xlsx' \
-  -F 'chunking_config={"strategy":"sectionwise","max_words":800,"overlap_words":80}'
+  -F 'chunking_config={"max_words":800,"overlap_words":80}'
 ```
 
-The synchronous MVP responds with an evaluation ID and URLs for the JSON report and Excel workbook. Reports are stored under `data/evaluations/<evaluation_id>/`; input PDF/DOCX/chunk files are not persisted. The default storage directory can be changed with `JUDGE_DATA_DIR`.
+The synchronous MVP responds with an evaluation ID and URLs for the JSON report, Excel workbook, and generated chunks JSON. Reports and generated chunks are stored under `data/evaluations/<evaluation_id>/`; uploaded PDF/DOCX files are not persisted. The default storage directory can be changed with `JUDGE_DATA_DIR`.
 
 ## Streamlit interface
 
-The Streamlit interface takes the PDFLens output ZIP, a chunks JSON file, and the original PDF separately when the ZIP does not contain it. It displays the summary and findings, and provides downloadable Excel and JSON reports. Start it from this folder:
+The Streamlit interface takes the PDFLens output ZIP and original source PDF. It generates section-wise chunks from the DOCX in the ZIP, evaluates them, and offers the generated chunks JSON plus Excel and JSON reports for download. Start it from this folder:
 
 ```sh
 uv run streamlit run streamlit_app.py --server.address 127.0.0.1 --server.port 8501

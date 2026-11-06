@@ -69,6 +69,9 @@ def _truncate(text: str, limit: int = 320) -> str:
 
 
 def _content_and_path(chunk: dict[str, Any], source_sections: list[dict[str, Any]]) -> None:
+    if chunk.get("body_text"):
+        chunk["body_content"] = str(chunk["body_text"]).strip()
+        return
     parts = [part.strip() for part in chunk["content"].split("|")]
     path = chunk["section_path"]
     if path:

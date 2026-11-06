@@ -7,6 +7,7 @@ from typing import Any
 
 import streamlit as st
 
+from chunking_strategy.sectionwise_chunking import chunk_docx_bytes
 from judge_app.config import settings
 from judge_app.evaluation import evaluate
 from judge_app.ingestion import (
@@ -41,57 +42,77 @@ with st.sidebar:
     st.subheader("Evaluation options")
     config_text = st.text_area(
         "Chunking configuration (optional JSON)",
-        value="{}",
+        value='{"max_words": 800, "overlap_words": 80}',
         height=190,
-        help="Optionally set the pass threshold and review boundary. These thresholds change the decision label, not the LLM criterion score.",
+        help="Set sectionwise chunk size and overlap, plus optional evaluation thresholds. The judge generates chunks from the DOCX inside the ZIP.",
     )
     st.caption(
         "All scored criteria require the configured on-prem LiteLLM endpoint. "
         "If the endpoint is unavailable, affected chunks show 'Could not evaluate'; the judge does not invent a result."
     )
 
-package_upload = st.file_uploader("PDFLens output ZIP", type=["zip"], key="package_zip",
-                                 help="The ZIP may contain document.docx, metadata.json, and assets. If it does not contain the original PDF, upload that PDF below.")
-source_pdf_upload = st.file_uploader("Original source PDF (if not inside ZIP)", type=["pdf"], key="source_pdf")
-chunks_upload = st.file_uploader("Section-wise chunks JSON", type=["json"], key="chunks_json")
+package_upload = st.file_uploader(
+    "PDFLens output ZIP", type=["zip"], key="package_zip",
+    help="The ZIP must include the DOCX and may include metadata.json, assets, and the original PDF.",
+)
+source_pdf_upload = st.file_uploader("Original source PDF", type=["pdf"], key="source_pdf")
+st.caption("The judge creates section-wise chunks from the DOCX inside the ZIP. If the ZIP also contains a PDF, it must match the PDF uploaded here.")
 
 if package_upload:
     st.caption(f"PDFLens package: {package_upload.name} · {package_upload.size / (1024 * 1024):.1f} MiB")
-if chunks_upload:
-    st.caption(f"Chunks: {chunks_upload.name} · {chunks_upload.size / 1024:.1f} KiB")
 if source_pdf_upload:
     st.caption(f"Source PDF: {source_pdf_upload.name} · {source_pdf_upload.size / (1024 * 1024):.1f} MiB")
 
 run_evaluation = st.button(
-    "Evaluate chunks",
+    "Create chunks and evaluate",
     type="primary",
-    disabled=not (package_upload and chunks_upload),
-    use_container_width=True,
+    disabled=not (package_upload and source_pdf_upload),
+    width="stretch",
 )
 
 if run_evaluation:
-    for key in ("judge_report", "judge_xlsx", "judge_json"):
+    for key in ("judge_report", "judge_xlsx", "judge_json", "judge_chunks_json"):
         st.session_state.pop(key, None)
     try:
         package_bytes = package_upload.getvalue()
-        chunks_bytes = chunks_upload.getvalue()
+        source_pdf_bytes = source_pdf_upload.getvalue()
         package = load_pdflens_package(
-            package_bytes,
-            source_pdf_upload.getvalue() if source_pdf_upload else None,
-            source_pdf_upload.name if source_pdf_upload else None,
+            package_bytes, source_pdf_bytes, source_pdf_upload.name,
         )
-        chunks = normalize_chunks(chunks_bytes, chunks_upload.name)
+        if not package.docx_bytes:
+            raise InputValidationError("PDFLens ZIP must contain the DOCX used to generate the chunks.")
         config = parse_config(config_text)
-        with st.spinner(f"Evaluating {len(chunks)} chunks against the PDFLens source…"):
+        max_words = int(config.get("max_words", 800))
+        overlap_words = int(config.get("overlap_words", 80))
+        if overlap_words >= max_words:
+            raise InputValidationError("overlap_words must be less than max_words for sectionwise chunking.")
+        config.setdefault("strategy", "sectionwise")
+        config["max_words"] = max_words
+        config["overlap_words"] = overlap_words
+        generated_chunks = chunk_docx_bytes(
+            package.docx_bytes, package.docx_name or "document.docx",
+            max_words=max_words, overlap_words=overlap_words,
+        )
+        chunks_bytes = (json.dumps(generated_chunks, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        chunks = normalize_chunks(chunks_bytes, "generated_sectionwise_chunks.json")
+        logger.info(
+            "sectionwise_chunks_generated package=%s docx=%s chunks=%s max_words=%s overlap_words=%s",
+            Path(package_upload.name).name, package.docx_name, len(chunks), max_words, overlap_words,
+        )
+        with st.spinner(f"Generated {len(chunks)} chunks. Evaluating against the PDFLens source…"):
             report = evaluate(package, chunks, config, sha256(chunks_bytes))
-            report["inputs"]["chunks_filename"] = Path(chunks_upload.name).name
+            report["inputs"]["chunks_filename"] = "generated_sectionwise_chunks.json"
+            report["inputs"]["chunks_generated_by_judge"] = True
             report["inputs"]["pdflens_package_filename"] = Path(package_upload.name).name
             workbook_bytes = build_report_xlsx(report)
             json_bytes = report_json_bytes(report)
         st.session_state["judge_report"] = report
         st.session_state["judge_xlsx"] = workbook_bytes
         st.session_state["judge_json"] = json_bytes
+        st.session_state["judge_chunks_json"] = chunks_bytes
     except InputValidationError as exc:
+        st.error(str(exc))
+    except ValueError as exc:
         st.error(str(exc))
     except Exception as exc:
         logger.exception("streamlit_evaluation_failed error_type=%s", type(exc).__name__)
@@ -150,9 +171,11 @@ if report:
             st.dataframe([
                 {"Reason": reason, "Items": count}
                 for reason, count in summary["unresolved_reasons"].items()
-            ], use_container_width=True, hide_index=True)
+            ], width="stretch", hide_index=True)
 
-    download_columns = st.columns(2)
+    generated_chunk_count = report.get("summary", {}).get("total_chunks", len(chunk_reports))
+    st.caption(f"Sectionwise chunks created by the judge: {generated_chunk_count}")
+    download_columns = st.columns(3)
     package_filename = report["inputs"].get("pdflens_package_filename", "document.zip")
     report_stem = Path(report.get("document_id") or Path(package_filename).stem).stem
     download_columns[0].download_button(
@@ -161,14 +184,21 @@ if report:
         file_name=f"{report_stem}_chunk_quality_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     )
     download_columns[1].download_button(
         "Download concise JSON report",
         data=st.session_state["judge_json"],
         file_name=f"{report_stem}_chunk_quality_report.json",
         mime="application/json",
-        use_container_width=True,
+        width="stretch",
+    )
+    download_columns[2].download_button(
+        "Download generated chunks JSON",
+        data=st.session_state["judge_chunks_json"],
+        file_name=f"{report_stem}_sectionwise_chunks.json",
+        mime="application/json",
+        width="stretch",
     )
 
     st.subheader("Chunk-by-chunk review")
@@ -248,7 +278,7 @@ if report:
                 action = action_labels.get(item.get("recommended_action"), "Check the cited evidence")
                 st.caption(f"Suggested action: {action}")
                 st.markdown("**Five-question checklist**")
-                st.dataframe(item.get("criteria", []), use_container_width=True, hide_index=True)
+                st.dataframe(item.get("criteria", []), width="stretch", hide_index=True)
                 if item["verdict"] == "Looks good":
                     st.markdown("**Chunk text**")
                     st.text(item.get("chunk_text") or "No chunk text was available.")
@@ -267,7 +297,7 @@ if report:
                  "Result": {"PASS": "No failures", "FAIL": "All assessed checks failed", "MIXED": "Some checks failed", "INCONCLUSIVE": "Needs evidence"}.get(item["status"], item["status"]),
                  "What it checks": item["what_it_checks"]}
                 for item in scorecard["dimensions"]
-            ], use_container_width=True, hide_index=True)
+            ], width="stretch", hide_index=True)
         else:
             st.write("No criterion outcomes were available. Check LiteLLM and source alignment before accepting the result.")
 
@@ -295,7 +325,7 @@ if report:
                 "CHECK_SOURCE": "Check the source passage", "RETRY_EVALUATION": "Fix the judge error and rerun",
             }.get(review_by_id.get(item["chunk_id"], {}).get("recommended_action"), "Review evidence"),
         } for item in report["chunks"]]
-        st.dataframe(chunk_rows, use_container_width=True, hide_index=True)
+        st.dataframe(chunk_rows, width="stretch", hide_index=True)
     with tabs[1]:
         outcome_labels = {"FAIL": "Needs a fix", "INCONCLUSIVE": "Check against source", "PASS": "Looks good"}
         selected_outcomes = st.multiselect(
@@ -316,7 +346,7 @@ if report:
         } for item in report["findings"]
           if item.get("criterion_id") in scored_ids
           and outcome_labels.get(item.get("outcome")) in selected_outcomes]
-        st.dataframe(visible_findings, use_container_width=True, hide_index=True)
+        st.dataframe(visible_findings, width="stretch", hide_index=True)
     with tabs[2]:
         grouped_sections: dict[str, list[dict[str, Any]]] = {}
         for item in chunk_reviews:
@@ -330,7 +360,7 @@ if report:
             "Looks good": sum(item["verdict"] == "Looks good" for item in items),
             "Could not evaluate": sum(item["verdict"] == "Could not evaluate" for item in items),
         } for name, items in grouped_sections.items()]
-        st.dataframe(section_rows, use_container_width=True, hide_index=True)
+        st.dataframe(section_rows, width="stretch", hide_index=True)
     with tabs[3]:
         coverage = report["coverage"]
         st.caption("These source coverage and PDF-to-DOCX comparisons are diagnostics only; they do not affect the LLM criteria score.")
@@ -340,9 +370,9 @@ if report:
         )
         if coverage["unmatched_docx_units"]:
             st.markdown("**DOCX source units not found in chunks**")
-            st.dataframe(coverage["unmatched_docx_units"], use_container_width=True, hide_index=True)
+            st.dataframe(coverage["unmatched_docx_units"], width="stretch", hide_index=True)
         if coverage["pdf_docx_upstream_issues"]:
             st.markdown("**Possible upstream PDF-to-DOCX omissions**")
-            st.dataframe(coverage["pdf_docx_upstream_issues"], use_container_width=True, hide_index=True)
+            st.dataframe(coverage["pdf_docx_upstream_issues"], width="stretch", hide_index=True)
 
     st.info("Use the chunk-by-chunk verdict and cited passages as the primary result. Source extraction diagnostics are separate.")

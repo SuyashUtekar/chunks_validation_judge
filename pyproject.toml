@@ -24,7 +24,7 @@ dependencies = [
 dev = ["pytest>=8,<9", "ruff>=0.6,<1"]
 
 [tool.setuptools.packages.find]
-include = ["judge_app*"]
+include = ["judge_app*", "chunking_strategy*"]
 
 [tool.ruff]
 line-length = 100
