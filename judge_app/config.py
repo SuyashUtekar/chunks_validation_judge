@@ -23,6 +23,16 @@ def _integer(name: str, default: int) -> int:
     return value
 
 
+def _float_setting(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+    if value < 0:
+        raise RuntimeError(f"{name} must be non-negative")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path = Path(os.getenv("JUDGE_DATA_DIR", str(APP_ROOT / "data" / "evaluations")))
@@ -38,13 +48,18 @@ class Settings:
     llm_max_workers: int = min(8, _integer("JUDGE_LLM_MAX_WORKERS", 4))
     llm_allow_remote: bool = os.getenv("JUDGE_LLM_ALLOW_REMOTE", "false").casefold() == "true"
     llm_json_mode: bool = os.getenv("JUDGE_LLM_JSON_MODE", "true").casefold() == "true"
+    llm_max_retries: int = _integer("JUDGE_LLM_MAX_RETRIES", 4)
+    llm_retry_base_delay_seconds: float = _float_setting("JUDGE_LLM_RETRY_BASE_DELAY_SECONDS", 1.0)
+    llm_retry_max_delay_seconds: float = _float_setting("JUDGE_LLM_RETRY_MAX_DELAY_SECONDS", 30.0)
+
 
 
 settings = Settings()
 logger.info(
     "judge_settings_loaded llm_url_configured=%s llm_model_configured=%s "
     "llm_api_key_configured=%s llm_json_mode=%s llm_timeout_seconds=%s llm_max_workers=%s "
-    "remote_llm_allowed=%s",
+    "llm_max_retries=%s remote_llm_allowed=%s",
     bool(settings.llm_base_url), bool(settings.llm_model), bool(settings.llm_api_key),
-    settings.llm_json_mode, settings.llm_timeout_seconds, settings.llm_max_workers, settings.llm_allow_remote,
+    settings.llm_json_mode, settings.llm_timeout_seconds, settings.llm_max_workers,
+    settings.llm_max_retries, settings.llm_allow_remote,
 )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import socket
 import time
 from ipaddress import ip_address, ip_network
@@ -14,6 +15,9 @@ import httpx
 from .config import settings
 
 logger = logging.getLogger(__name__)
+
+# HTTP statuses the proxy may return while temporarily overloaded; safe to retry.
+_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 class LLMUnavailableError(RuntimeError):
@@ -103,10 +107,8 @@ class OpenAICompatibleJudge:
         }
         if settings.llm_json_mode:
             body["response_format"] = {"type": "json_object"}
+        response = self._post_with_retry(headers, body, evaluation_id, chunk_id, started)
         try:
-            with httpx.Client(timeout=settings.llm_timeout_seconds, follow_redirects=False) as client:
-                response = client.post(self.endpoint, headers=headers, json=body)
-                response.raise_for_status()
             envelope = response.json()
             choice = envelope["choices"][0]
             finish_reason = choice.get("finish_reason")
@@ -127,38 +129,6 @@ class OpenAICompatibleJudge:
                 time.perf_counter() - started, len(result["criteria"]), finish_reason,
             )
             return result
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status in {401, 403}:
-                message = f"LiteLLM returned HTTP {status}: check JUDGE_LLM_API_KEY and proxy access."
-            elif status == 404:
-                message = f"LiteLLM returned HTTP 404: check the proxy URL and model alias ({self.model})."
-            elif status in {400, 415, 422}:
-                message = (f"LiteLLM returned HTTP {status}: check the model alias and JSON response mode; "
-                           "set JUDGE_LLM_JSON_MODE=false if the model rejects response_format.")
-            elif status == 429:
-                message = "LiteLLM returned HTTP 429: the proxy rate limit or model capacity was reached."
-            else:
-                message = f"LiteLLM returned HTTP {status}; check the proxy/model server logs."
-            logger.error("llm_call_http_error evaluation_id=%s chunk_id=%s model=%s status=%s elapsed_seconds=%.2f",
-                         evaluation_id, chunk_id, self.model, status, time.perf_counter() - started)
-            raise LLMUnavailableError(message) from exc
-        except httpx.TimeoutException as exc:
-            logger.error("llm_call_timeout evaluation_id=%s chunk_id=%s model=%s timeout_seconds=%s",
-                         evaluation_id, chunk_id, self.model, settings.llm_timeout_seconds)
-            raise LLMUnavailableError(
-                f"LiteLLM request timed out after {settings.llm_timeout_seconds}s; increase JUDGE_LLM_TIMEOUT_SECONDS or check the proxy."
-            ) from exc
-        except httpx.ConnectError as exc:
-            logger.error("llm_call_connect_error evaluation_id=%s chunk_id=%s model=%s error_type=%s elapsed_seconds=%.2f",
-                         evaluation_id, chunk_id, self.model, type(exc).__name__, time.perf_counter() - started)
-            raise LLMUnavailableError(
-                "Could not connect to the LiteLLM host; check the URL, VPN, DNS, and firewall."
-            ) from exc
-        except httpx.HTTPError as exc:
-            logger.error("llm_call_network_error evaluation_id=%s chunk_id=%s model=%s error_type=%s elapsed_seconds=%.2f",
-                         evaluation_id, chunk_id, self.model, type(exc).__name__, time.perf_counter() - started)
-            raise LLMUnavailableError(f"LiteLLM network request failed ({type(exc).__name__}).") from exc
         except json.JSONDecodeError as exc:
             logger.error(
                 "llm_call_response_envelope_invalid evaluation_id=%s chunk_id=%s model=%s "
@@ -187,3 +157,79 @@ class OpenAICompatibleJudge:
             raise LLMUnavailableError(
                 f"LiteLLM returned an incomplete chat-completions response ({type(exc).__name__})."
             ) from exc
+
+    def _post_with_retry(self, headers: dict[str, str], body: dict[str, Any], evaluation_id: str,
+                         chunk_id: str, started: float) -> httpx.Response:
+        """POST the judge prompt, retrying transient 429/5xx responses with backoff.
+
+        The proxy returns 429 when its rate limit or model capacity is momentarily
+        exhausted. Waiting out the ``Retry-After`` hint (or an exponential backoff)
+        avoids failing the whole chunk on a single throttled request.
+        """
+        max_attempts = 1 + max(0, settings.llm_max_retries)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                with httpx.Client(timeout=settings.llm_timeout_seconds, follow_redirects=False) as client:
+                    response = client.post(self.endpoint, headers=headers, json=body)
+                    response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status in _RETRYABLE_STATUS and attempt < max_attempts:
+                    delay = self._retry_delay(exc.response, attempt)
+                    logger.warning(
+                        "llm_call_retrying evaluation_id=%s chunk_id=%s model=%s status=%s "
+                        "attempt=%s/%s delay_seconds=%.2f",
+                        evaluation_id, chunk_id, self.model, status, attempt, max_attempts, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                if status in {401, 403}:
+                    message = f"LiteLLM returned HTTP {status}: check JUDGE_LLM_API_KEY and proxy access."
+                elif status == 404:
+                    message = f"LiteLLM returned HTTP 404: check the proxy URL and model alias ({self.model})."
+                elif status in {400, 415, 422}:
+                    message = (f"LiteLLM returned HTTP {status}: check the model alias and JSON response mode; "
+                               "set JUDGE_LLM_JSON_MODE=false if the model rejects response_format.")
+                elif status == 429:
+                    message = ("LiteLLM returned HTTP 429: the proxy rate limit or model capacity was reached after "
+                               f"{attempt} attempt(s); lower JUDGE_LLM_MAX_WORKERS or increase the proxy limit.")
+                else:
+                    message = f"LiteLLM returned HTTP {status}; check the proxy/model server logs."
+                logger.error("llm_call_http_error evaluation_id=%s chunk_id=%s model=%s status=%s elapsed_seconds=%.2f",
+                             evaluation_id, chunk_id, self.model, status, time.perf_counter() - started)
+                raise LLMUnavailableError(message) from exc
+            except httpx.TimeoutException as exc:
+                logger.error("llm_call_timeout evaluation_id=%s chunk_id=%s model=%s timeout_seconds=%s",
+                             evaluation_id, chunk_id, self.model, settings.llm_timeout_seconds)
+                raise LLMUnavailableError(
+                    f"LiteLLM request timed out after {settings.llm_timeout_seconds}s; increase JUDGE_LLM_TIMEOUT_SECONDS or check the proxy."
+                ) from exc
+            except httpx.ConnectError as exc:
+                logger.error("llm_call_connect_error evaluation_id=%s chunk_id=%s model=%s error_type=%s elapsed_seconds=%.2f",
+                             evaluation_id, chunk_id, self.model, type(exc).__name__, time.perf_counter() - started)
+                raise LLMUnavailableError(
+                    "Could not connect to the LiteLLM host; check the URL, VPN, DNS, and firewall."
+                ) from exc
+            except httpx.HTTPError as exc:
+                logger.error("llm_call_network_error evaluation_id=%s chunk_id=%s model=%s error_type=%s elapsed_seconds=%.2f",
+                             evaluation_id, chunk_id, self.model, type(exc).__name__, time.perf_counter() - started)
+                raise LLMUnavailableError(f"LiteLLM network request failed ({type(exc).__name__}).") from exc
+
+    @staticmethod
+    def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
+        """Backoff before retrying: honor the proxy Retry-After hint, else exponential with jitter."""
+        retry_after = None
+        if response is not None:
+            raw = response.headers.get("Retry-After")
+            if raw:
+                try:
+                    retry_after = float(raw)
+                except ValueError:
+                    retry_after = None
+        if retry_after is not None and retry_after > 0:
+            return min(retry_after, settings.llm_retry_max_delay_seconds)
+        base = min(settings.llm_retry_base_delay_seconds * (2 ** (attempt - 1)), settings.llm_retry_max_delay_seconds)
+        return base + random.uniform(0.0, base * 0.25)

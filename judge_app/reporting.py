@@ -202,6 +202,8 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
     values = [
         ("Decision", compact["quality_gate_label"]),
         ("What this means", compact["what_this_means"]),
+        ("Rating", f"{compact['score_explanation']['rating_percent']}%"
+                    if compact["score_explanation"]["rating_percent"] is not None else "Not available"),
         ("Chunks evaluated", compact["review_summary"]["total_chunks"]),
         ("Chunks with evidence-backed issues", compact["review_summary"]["chunks_needing_correction"]),
         ("Chunks to verify against source", compact["review_summary"]["chunks_needing_source_review"]),
