@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -260,7 +261,139 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
         if fill:
             chunk_sheet.cell(row=row, column=1).fill = PatternFill("solid", fgColor=fill)
 
-    queue_sheet = workbook.create_sheet("Evidence & Actions", 2)
+    criteria = [
+        item for item in report.get("criteria", [])
+        if item.get("method") == "llm" and item.get("scope") == "chunk"
+    ]
+    criteria_sheet = workbook.create_sheet("Chunk Criteria Review", 2)
+    headers = ["Chunk ID", "Section"]
+    for criterion in criteria:
+        name = str(criterion.get("name") or criterion.get("id") or "Criterion")
+        headers.extend([f"{name} — score (0–1)", f"{name} — review"])
+    headers.extend(["Final LLM verdict", "Severity", "Human review"])
+    criteria_sheet.append([
+        "Score guide: 1 = Looks good; 0 = Needs a fix; blank = not assessed or not applicable. "
+        "Human review is intentionally left empty."
+    ])
+    criteria_sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    guide = criteria_sheet.cell(row=1, column=1)
+    guide.fill = _SUBHEADER_FILL
+    guide.font = Font(name="Arial", size=10, italic=True, color="404040")
+    guide.alignment = Alignment(vertical="center", wrap_text=True)
+    criteria_sheet.row_dimensions[1].height = 30
+    criteria_sheet.append(headers)
+    _style_header(criteria_sheet, row_number=2)
+    criteria_sheet.row_dimensions[2].height = 54
+
+    criterion_findings = {
+        (item.get("chunk_id"), item.get("criterion_id")): item
+        for item in report.get("findings", [])
+        if item.get("method") == "llm"
+    }
+    severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    score_value = {"PASS": 1.0, "FAIL": 0.0}
+    for review in compact["chunk_reviews"]:
+        values = [
+            _excel_safe(review.get("chunk_id")),
+            _excel_safe(" > ".join(review.get("section_path", [])) or "No section path"),
+        ]
+        failed_severities = []
+        for criterion in criteria:
+            finding = criterion_findings.get((review.get("chunk_id"), criterion.get("id")), {})
+            outcome = finding.get("outcome")
+            score = score_value.get(outcome, "")
+            explanation = _short(finding.get("explanation") or "No criterion assessment was returned.", 260)
+            outcome_label = {
+                "PASS": "Looks good", "FAIL": "Needs a fix",
+                "INCONCLUSIVE": "Check against source", "N/A": "Not applicable",
+            }.get(outcome, "Could not evaluate")
+            improvement = finding.get("improvement")
+            criterion_review = f"{outcome_label}: {explanation}"
+            if improvement and outcome in {"FAIL", "INCONCLUSIVE"}:
+                criterion_review += f" Suggested improvement: {_short(improvement, 180)}"
+            values.extend([score, _excel_safe(criterion_review)])
+            if outcome == "FAIL" and finding.get("severity") in severity_rank:
+                failed_severities.append(finding["severity"])
+
+        verdict_parts = [
+            f"{review.get('verdict', 'Could not evaluate')}: "
+            f"{_short(review.get('summary'), 420)}"
+        ]
+        for label, field_name in (("Strength", "strengths"), ("Problem", "problems"),
+                                  ("Verify", "checks_to_verify")):
+            for detail in review.get(field_name, [])[:2]:
+                verdict_parts.append(
+                    f"{label} — {detail.get('criterion', 'Review')}: "
+                    f"{_short(detail.get('explanation'), 220)}"
+                )
+        if review.get("improvements"):
+            verdict_parts.append(f"Next step: {_short(review['improvements'][0], 240)}")
+        if failed_severities:
+            severity = min(failed_severities, key=severity_rank.get)
+        elif review.get("verdict") == "Looks good":
+            severity = "None"
+        elif review.get("verdict") == "Needs a fix":
+            severity = "Not specified"
+        else:
+            severity = "Not assessed"
+        values.extend([
+            _excel_safe("\n".join(verdict_parts)),
+            severity,
+            "",  # Reserved for a human reviewer to fill in.
+        ])
+        criteria_sheet.append(values)
+
+    criteria_sheet.freeze_panes = "C3"
+    criteria_sheet.auto_filter.ref = f"A2:{criteria_sheet.cell(row=2, column=len(headers)).column_letter}{criteria_sheet.max_row}"
+    criteria_sheet.column_dimensions["A"].width = 22
+    criteria_sheet.column_dimensions["B"].width = 42
+    for index in range(3, 3 + len(criteria) * 2, 2):
+        criteria_sheet.column_dimensions[criteria_sheet.cell(row=1, column=index).column_letter].width = 14
+        criteria_sheet.column_dimensions[criteria_sheet.cell(row=1, column=index + 1).column_letter].width = 48
+    final_column = 3 + len(criteria) * 2
+    criteria_sheet.column_dimensions[criteria_sheet.cell(row=1, column=final_column).column_letter].width = 76
+    criteria_sheet.column_dimensions[criteria_sheet.cell(row=1, column=final_column + 1).column_letter].width = 18
+    criteria_sheet.column_dimensions[criteria_sheet.cell(row=1, column=final_column + 2).column_letter].width = 28
+    _style_body(criteria_sheet, min_row=3)
+    for row_number in range(3, criteria_sheet.max_row + 1):
+        estimated_lines = 1
+        for value in criteria_sheet[row_number]:
+            width = criteria_sheet.column_dimensions[value.column_letter].width or 18
+            for line in str(value.value or "").splitlines() or [""]:
+                estimated_lines = max(estimated_lines, math.ceil(len(line) / max(8, width)))
+        criteria_sheet.row_dimensions[row_number].height = min(360, max(54, estimated_lines * 15 + 8))
+        verdict_cell = criteria_sheet.cell(row=row_number, column=final_column)
+        verdict_label = str(verdict_cell.value or "").split(":", 1)[0]
+        verdict_fill = {
+            "Needs a fix": "FCE4D6", "Check against source": "FFF2CC",
+            "Looks good": "E2F0D9", "Could not evaluate": "D9EAF7",
+        }.get(verdict_label)
+        if verdict_fill:
+            verdict_cell.fill = PatternFill("solid", fgColor=verdict_fill)
+        severity_cell = criteria_sheet.cell(row=row_number, column=final_column + 1)
+        severity_fill = {
+            "CRITICAL": "F4CCCC", "HIGH": "FCE4D6",
+            "MEDIUM": "FFF2CC", "LOW": "D9EAF7",
+        }.get(severity_cell.value)
+        if severity_fill:
+            severity_cell.fill = PatternFill("solid", fgColor=severity_fill)
+        for index in range(3, 3 + len(criteria) * 2, 2):
+            score_cell = criteria_sheet.cell(row=row_number, column=index)
+            score_cell.number_format = "0.00"
+            score_cell.alignment = Alignment(horizontal="center", vertical="top")
+            outcome = criterion_findings.get(
+                (criteria_sheet.cell(row=row_number, column=1).value,
+                 criteria[index // 2 - 1].get("id")),
+                {},
+            ).get("outcome")
+            fill = {"PASS": "E2F0D9", "FAIL": "FCE4D6", "INCONCLUSIVE": "FFF2CC"}.get(outcome)
+            if fill:
+                criteria_sheet.cell(row=row_number, column=index + 1).fill = PatternFill("solid", fgColor=fill)
+        criteria_sheet.cell(row=row_number, column=final_column + 2).fill = PatternFill(
+            "solid", fgColor="FFF2CC"
+        )
+
+    queue_sheet = workbook.create_sheet("Evidence & Actions", 3)
     queue_sheet.append(["Reviewer result", "Chunk", "Section", "Criterion", "Why it was flagged",
                         "Source reference", "Source passage", "Chunk text", "Suggested improvement", "Action"])
     _style_header(queue_sheet)
