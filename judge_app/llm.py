@@ -39,6 +39,21 @@ def _parse_criteria_content(content: str) -> tuple[dict[str, Any], int]:
     raise ValueError("message.content contains no JSON object with a criteria array")
 
 
+def _parse_visual_content(content: str) -> dict[str, Any]:
+    """Find the structured visual-review object in model text or a code fence."""
+    decoder = json.JSONDecoder()
+    for offset, char in enumerate(content):
+        if char != "{":
+            continue
+        try:
+            result, _end = decoder.raw_decode(content, offset)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict) and isinstance(result.get("visual_review"), dict):
+            return result
+    raise ValueError("message.content contains no visual_review object")
+
+
 def _approved_host(host: str) -> bool:
     normalized = host.casefold().rstrip(".")
     if normalized in {"localhost", "localhost.localdomain"} or normalized.endswith((".local", ".internal", ".lan")):
@@ -158,6 +173,70 @@ class OpenAICompatibleJudge:
                 f"LiteLLM returned an incomplete chat-completions response ({type(exc).__name__})."
             ) from exc
 
+    def judge_visual(
+        self,
+        payload: dict[str, Any],
+        image_data_urls: list[str],
+    ) -> dict[str, Any]:
+        """Run an advisory visual second review with PDF page screenshots."""
+        evaluation_id = str(payload.get("evaluation_id") or "unknown")
+        chunk_id = str(payload.get("chunk", {}).get("chunk_id") or "unknown")
+        pages = payload.get("pages", [])
+        started = time.perf_counter()
+        prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "visual_chunk_review_v1.txt"
+        content: list[dict[str, Any]] = [{
+            "type": "text",
+            "text": json.dumps(payload, ensure_ascii=False),
+        }]
+        content.extend({
+            "type": "image_url",
+            "image_url": {"url": data_url, "detail": "high"},
+        } for data_url in image_data_urls)
+        logger.info(
+            "llm_visual_call_started evaluation_id=%s chunk_id=%s model=%s pages=%s images=%s",
+            evaluation_id, chunk_id, self.model, ",".join(map(str, pages)), len(image_data_urls),
+        )
+        headers = {"Content-Type": "application/json"}
+        if settings.llm_api_key:
+            headers["Authorization"] = f"Bearer {settings.llm_api_key}"
+        body: dict[str, Any] = {
+            "model": self.model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": prompt_path.read_text(encoding="utf-8")},
+                {"role": "user", "content": content},
+            ],
+        }
+        if settings.llm_json_mode:
+            body["response_format"] = {"type": "json_object"}
+        response = self._post_with_retry(headers, body, evaluation_id, chunk_id, started)
+        try:
+            envelope = response.json()
+            choice = envelope["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            message = choice["message"]["content"]
+            if not isinstance(message, str):
+                raise TypeError("LLM message.content was not text")
+            result = _parse_visual_content(message)
+            visual = result["visual_review"]
+            if not isinstance(visual.get("verdict"), str):
+                raise ValueError("visual_review.verdict is missing")
+            logger.info(
+                "llm_visual_call_succeeded evaluation_id=%s chunk_id=%s model=%s pages=%s "
+                "elapsed_seconds=%.2f finish_reason=%s",
+                evaluation_id, chunk_id, self.model, ",".join(map(str, pages)),
+                time.perf_counter() - started, finish_reason,
+            )
+            return visual
+        except (json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError) as exc:
+            logger.error(
+                "llm_visual_response_error evaluation_id=%s chunk_id=%s model=%s error_type=%s "
+                "elapsed_seconds=%.2f",
+                evaluation_id, chunk_id, self.model, type(exc).__name__, time.perf_counter() - started,
+            )
+            raise LLMUnavailableError(
+                f"LiteLLM returned an invalid visual-review response ({type(exc).__name__})."
+            ) from exc
     def _post_with_retry(self, headers: dict[str, str], body: dict[str, Any], evaluation_id: str,
                          chunk_id: str, started: float) -> httpx.Response:
         """POST the judge prompt, retrying transient 429/5xx responses with backoff.

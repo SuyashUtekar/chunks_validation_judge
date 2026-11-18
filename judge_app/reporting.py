@@ -137,7 +137,7 @@ def compact_report(report: dict[str, Any]) -> dict[str, Any]:
         for item in report.get("scorecard", {}).get("dimensions", [])
     ]
     return {
-        "report_version": "human-chunk-review-5",
+        "report_version": "human-chunk-review-6",
         "evaluation_id": report.get("evaluation_id"),
         "created_at": report.get("created_at"),
         "quality_gate": report.get("quality_gate"),
@@ -145,6 +145,8 @@ def compact_report(report: dict[str, Any]) -> dict[str, Any]:
         "what_this_means": review_counts.get("message") or report.get("action_plan", {}).get("summary"),
         "review_summary": review_counts,
         "chunk_reviews": report.get("chunk_reviews", []),
+        "visual_reviews": report.get("visual_reviews", []),
+        "visual_review_summary": report.get("visual_review_summary", {}),
         "document": {
             "title": metadata.get("document_title") or report.get("document_id"),
             "source_docx": Path(str(source_docx)).name if source_docx else input_docx,
@@ -191,7 +193,7 @@ def _style_body(sheet: Any, min_row: int = 2) -> None:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
 
 
-def build_report_xlsx(report: dict[str, Any]) -> bytes:
+def _build_legacy_report_xlsx(report: dict[str, Any]) -> bytes:
     """Build a workbook with the criterion score, plain-language result, actions, and evidence."""
     compact = compact_report(report)
     workbook = Workbook()
@@ -435,6 +437,175 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
     return output.getvalue()
 
 
+def build_report_xlsx(report: dict[str, Any]) -> bytes:
+    """Build a compact workbook with summary, criterion evidence, and visual review."""
+    compact = compact_report(report)
+    workbook = Workbook()
+    reviews = compact["chunk_reviews"]
+    criteria = [item for item in report.get("criteria", [])
+                if item.get("method") == "llm" and item.get("scope") == "chunk"]
+    primary_ids = {item.get("id") for item in criteria}
+    findings = {(item.get("chunk_id"), item.get("criterion_id")): item
+                for item in report.get("findings", []) if item.get("method") == "llm"}
+    visual = compact["visual_reviews"]
+    severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    action_labels = {
+        "KEEP_AS_IS": "Keep as is", "EDIT_CHUNK_TEXT": "Edit chunk text",
+        "MOVE_TO_SECTION": "Move to the correct section", "SPLIT_CHUNK": "Split this chunk",
+        "ADJUST_BOUNDARY": "Adjust the chunk boundary", "ADD_CONTEXT": "Add necessary context",
+        "CHECK_SOURCE": "Check the source passage", "CHECK_PDFLENS": "Review PDF-to-DOCX extraction",
+        "RETRY_EVALUATION": "Fix judge error and rerun",
+    }
+
+    overview = workbook.active
+    overview.title = "Overview"
+    overview.append(["Result", "Details"])
+    _style_header(overview)
+    summary = compact["review_summary"]
+    visual_states = [item.get("status") for item in visual]
+    rows = [
+        ("Decision", compact["quality_gate_label"]),
+        ("What this means", compact["what_this_means"]),
+        ("Text criteria rating", f"{compact['score_explanation']['rating_percent']}%"
+         if compact["score_explanation"]["rating_percent"] is not None else "Not available"),
+        ("Chunks reviewed", summary["total_chunks"]),
+        ("Chunks needing a fix", summary["chunks_needing_correction"]),
+        ("Chunks to verify against source", summary["chunks_needing_source_review"]),
+        ("Chunks with no flagged issue", summary["chunks_with_no_flagged_issue"]),
+        ("Chunks not evaluated", summary["chunks_not_evaluated"]),
+        ("Visual reviews completed", visual_states.count("Reviewed")),
+        ("Visual reviews not selected", visual_states.count("Not selected")),
+        ("Visual reviews needing manual review", visual_states.count("Not reviewed")),
+        ("Score is based on", "The five text-based chunking criteria only"),
+        ("Visual review impact", "Advisory only; visual findings do not change the score"),
+        ("Score guide", "1 = Looks good; 0 = Needs a fix; blank = unresolved or not applicable"),
+        ("Document", compact["document"]["title"]),
+        ("Source DOCX", compact["document"]["source_docx"]),
+        ("Chunking strategy", compact["document"]["strategy"]),
+        ("Evaluation ID", compact["evaluation_id"]),
+    ]
+    for label, value in rows:
+        overview.append([label, _excel_safe(value)])
+    overview.column_dimensions["A"].width = 38
+    overview.column_dimensions["B"].width = 96
+    _style_body(overview)
+    for row in overview.iter_rows(min_row=2):
+        row[0].fill = _SUBHEADER_FILL
+        row[0].font = Font(bold=True)
+    overview.freeze_panes = "A2"
+
+    summary_sheet = workbook.create_sheet("Chunk Summary")
+    summary_sheet.append(["Chunk ID", "Section", "Checks passed", "Checks failed",
+                         "Checks to verify", "Checks unavailable", "LLM verdict", "What the judge found",
+                         "What works", "Problem", "Suggested improvement", "Severity",
+                         "Suggested action", "Human review"])
+    _style_header(summary_sheet)
+    for review in reviews:
+        chunk_id = review.get("chunk_id")
+        chunk_findings = [findings.get((chunk_id, criterion_id), {}) for criterion_id in primary_ids]
+        passed = sum(item.get("outcome") == "PASS" for item in chunk_findings)
+        failed = sum(item.get("outcome") == "FAIL" for item in chunk_findings)
+        call_unavailable = review.get("verdict") == "Could not evaluate"
+        source_check = sum(item.get("outcome") == "INCONCLUSIVE" for item in chunk_findings) if not call_unavailable else 0
+        unavailable = sum(item.get("outcome") == "INCONCLUSIVE" for item in chunk_findings) if call_unavailable else 0
+        severities = [item.get("severity") for item in chunk_findings
+                      if item.get("outcome") == "FAIL" and item.get("severity") in severity_rank]
+        severity = min(severities, key=severity_rank.get) if severities else (
+            "None" if review.get("verdict") == "Looks good" else "Not assessed")
+        strengths = "; ".join(f"{item.get('criterion')}: {item.get('explanation')}"
+                               for item in review.get("strengths", [])[:2])
+        problems = "; ".join(f"{item.get('criterion')}: {item.get('explanation')}"
+                              for item in review.get("problems", [])[:3])
+        improvements = "; ".join(review.get("improvements", [])[:2])
+        summary_sheet.append([
+            _excel_safe(chunk_id), _excel_safe(" > ".join(review.get("section_path") or []) or "No section path"),
+            passed, failed, source_check, unavailable,
+            _excel_safe(review.get("verdict")), _excel_safe(_short(review.get("summary"), 650)),
+            _excel_safe(_short(strengths, 700)), _excel_safe(_short(problems, 1000)),
+            _excel_safe(_short(improvements, 700)), severity,
+            action_labels.get(review.get("recommended_action"), "Review evidence"), "",
+        ])
+    summary_sheet.freeze_panes = "A2"
+    summary_sheet.auto_filter.ref = summary_sheet.dimensions
+    for col, width in {"A": 20, "B": 42, "C": 14, "D": 14, "E": 18, "F": 13,
+                       "G": 22, "H": 62, "I": 62, "J": 68, "K": 64, "L": 16,
+                       "M": 32, "N": 28}.items():
+        summary_sheet.column_dimensions[col].width = width
+    _style_body(summary_sheet)
+    for row in range(2, summary_sheet.max_row + 1):
+        verdict = summary_sheet.cell(row, 7).value
+        if verdict in _OUTCOME_FILLS:
+            summary_sheet.cell(row, 7).fill = _OUTCOME_FILLS[verdict]
+        summary_sheet.cell(row, 14).fill = PatternFill("solid", fgColor="FFF2CC")
+
+    evidence = workbook.create_sheet("Criterion Evidence")
+    evidence.append(["Chunk ID", "Section", "Criterion", "Score (0–1)", "Result", "Why this result",
+                     "Source reference", "Source passage", "Chunk passage", "Suggested improvement", "Severity"])
+    _style_header(evidence)
+    labels = {"PASS": "Looks good", "FAIL": "Needs a fix", "INCONCLUSIVE": "Check against source", "N/A": "Not applicable"}
+    for review in reviews:
+        chunk_id = review.get("chunk_id")
+        section = " > ".join(review.get("section_path") or []) or "No section path"
+        for criterion in criteria:
+            finding = findings.get((chunk_id, criterion.get("id")), {})
+            outcome = finding.get("outcome")
+            evidence.append([
+                _excel_safe(chunk_id), _excel_safe(section),
+                _excel_safe(criterion.get("name") or criterion.get("id")),
+                {"PASS": 1, "FAIL": 0}.get(outcome, ""), labels.get(outcome, "Could not evaluate"),
+                _excel_safe(_short(finding.get("explanation") or "No criterion result was returned.", 800)),
+                _excel_safe(finding.get("source_evidence_refs") or []),
+                _excel_safe(_short(finding.get("source_excerpt"), 1400)),
+                _excel_safe(_short(finding.get("chunk_excerpt"), 1400)),
+                _excel_safe(_short(finding.get("improvement"), 700)), finding.get("severity") or "",
+            ])
+    evidence.freeze_panes = "A2"
+    evidence.auto_filter.ref = evidence.dimensions
+    for col, width in {"A": 20, "B": 42, "C": 38, "D": 14, "E": 24, "F": 62,
+                       "G": 30, "H": 72, "I": 72, "J": 62, "K": 16}.items():
+        evidence.column_dimensions[col].width = width
+    _style_body(evidence)
+    for row in range(2, evidence.max_row + 1):
+        evidence.cell(row, 4).number_format = "0"
+        evidence.cell(row, 4).alignment = Alignment(horizontal="center", vertical="top")
+        fill = {"Looks good": "E2F0D9", "Needs a fix": "FCE4D6",
+                "Check against source": "FFF2CC", "Could not evaluate": "D9EAF7"}.get(evidence.cell(row, 5).value)
+        if fill:
+            evidence.cell(row, 5).fill = PatternFill("solid", fgColor=fill)
+
+    visual_sheet = workbook.create_sheet("Visual Review")
+    visual_sheet.append(["Chunk ID", "Section", "Review status", "Why selected / not selected", "PDF page(s)",
+                         "Visual observation", "Comparison with chunk", "Visual verdict", "Confidence",
+                         "Severity", "Suggested improvement", "Human review"])
+    _style_header(visual_sheet)
+    for item in visual:
+        visual_sheet.append([
+            _excel_safe(item.get("chunk_id")),
+            _excel_safe(" > ".join(item.get("section_path") or []) or "No section path"),
+            _excel_safe(item.get("status")), _excel_safe(item.get("reason")),
+            _excel_safe(item.get("page_numbers") or []),
+            _excel_safe(_short(item.get("visual_observation"), 1200)),
+            _excel_safe(_short(item.get("chunk_comparison"), 1200)),
+            _excel_safe(item.get("verdict")), item.get("confidence"),
+            _excel_safe(item.get("severity") or ""), _excel_safe(_short(item.get("improvement"), 800)), "",
+        ])
+    if not visual:
+        visual_sheet.append(["No visual review data was produced for this evaluation."])
+    visual_sheet.freeze_panes = "A2"
+    visual_sheet.auto_filter.ref = visual_sheet.dimensions
+    for col, width in {"A": 20, "B": 42, "C": 20, "D": 62, "E": 16, "F": 68,
+                       "G": 68, "H": 24, "I": 14, "J": 16, "K": 62, "L": 28}.items():
+        visual_sheet.column_dimensions[col].width = width
+    _style_body(visual_sheet)
+    for row in range(2, visual_sheet.max_row + 1):
+        visual_sheet.cell(row, 12).fill = PatternFill("solid", fgColor="FFF2CC")
+        visual_sheet.cell(row, 9).number_format = "0%"
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def report_json_bytes(report: dict[str, Any]) -> bytes:
     compact = compact_report(report)
     action_labels = {
@@ -460,6 +631,8 @@ def report_json_bytes(report: dict[str, Any]) -> bytes:
         },
         "review_summary": compact["review_summary"],
         "chunk_reviews": chunk_reviews,
+        "visual_reviews": compact["visual_reviews"],
+        "visual_review_summary": compact["visual_review_summary"],
         "five_review_questions": compact["scorecard"],
         "scoring_details": compact["score_explanation"],
         "source_diagnostics": compact["coverage"],

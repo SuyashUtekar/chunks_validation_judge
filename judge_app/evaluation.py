@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import logging
 import re
@@ -48,6 +49,11 @@ _TOKEN_RE = re.compile(r"[\w]+(?:[.,:/%-][\w]+)*", re.UNICODE)
 _NUMBER_RE = re.compile(r"(?<!\w)(?:\d{1,4}[-/.]){1,2}\d{1,4}|\d[\d,]*(?:\.\d+)?\s*%?", re.UNICODE)
 _VISUAL_TAG_RE = re.compile(
     r"(?:<doc_ai\s+type=['\"](?:image|table)['\"]|\[\[(?:IMAGE|TABLE):)", re.IGNORECASE
+)
+_VISUAL_REFERENCE_RE = re.compile(
+    r"\b(?:fig(?:ure)?|table|chart|graph|diagram|illustration)\s*(?:no\.?\s*)?\d+\b"
+    r"|\b(?:see|shown in|refer to) the (?:figure|table|chart|diagram)\b",
+    re.IGNORECASE,
 )
 
 
@@ -383,6 +389,214 @@ def _add_llm_findings(chunks: list[dict[str, Any]], matches: dict[str, list[dict
             "could_not_evaluate_chunk_ids": could_not_evaluate_chunk_ids,
             "parallel_workers": worker_count,
             "prompt_version": "chunk_judge_v5"}
+
+
+def _render_pdf_page_images(pdf_bytes: bytes, page_numbers: list[int]) -> list[str]:
+    """Render selected 1-based PDF pages as compact PNG data URLs for vision review."""
+    import pymupdf
+
+    pdf = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        images = []
+        for page_number in page_numbers:
+            if page_number < 1 or page_number > pdf.page_count:
+                continue
+            page = pdf[page_number - 1]
+            matrix = pymupdf.Matrix(settings.llm_visual_render_scale, settings.llm_visual_render_scale)
+            png = page.get_pixmap(matrix=matrix, alpha=False).tobytes("png")
+            images.append("data:image/png;base64," + base64.b64encode(png).decode("ascii"))
+        return images
+    finally:
+        pdf.close()
+
+
+def _add_visual_reviews(
+    chunks: list[dict[str, Any]],
+    pdf_bytes: bytes,
+    pdf_units: list[dict[str, Any]],
+    page_count: int,
+    evaluation_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run optional visual checks only for chunks with a visual cue and matched pages."""
+    reviews: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for chunk in chunks:
+        content = str(chunk.get("body_content") or chunk.get("content") or "")
+        explicit_visual = _VISUAL_TAG_RE.search(content) or _VISUAL_REFERENCE_RE.search(content)
+        low_alignment_with_page = (
+            chunk.get("alignment_confidence") is not None
+            and float(chunk.get("alignment_confidence") or 0.0) < 0.35
+            and bool(chunk.get("page_numbers"))
+        )
+        if not settings.llm_visual_review_enabled:
+            reviews.append({
+                "chunk_id": chunk["chunk_id"], "section_path": chunk.get("section_path", []),
+                "status": "Not selected", "reason": "Multimodal review is disabled in settings.",
+                "page_numbers": [], "page_refs": [], "visual_observation": "",
+                "chunk_comparison": "", "verdict": "NOT_APPLICABLE", "confidence": None,
+                "severity": None, "improvement": "",
+            })
+            continue
+        if not explicit_visual and not low_alignment_with_page:
+            reviews.append({
+                "chunk_id": chunk["chunk_id"], "section_path": chunk.get("section_path", []),
+                "status": "Not selected", "reason": "No image, table, figure, or chart reference was found in this chunk.",
+                "page_numbers": [], "page_refs": [], "visual_observation": "",
+                "chunk_comparison": "", "verdict": "NOT_APPLICABLE", "confidence": None,
+                "severity": None, "improvement": "",
+            })
+            continue
+
+        supplied_pages = chunk.get("page_numbers") or chunk.get("aligned_pages") or []
+        pages: list[int] = []
+        for value in supplied_pages:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= number <= page_count and number not in pages:
+                pages.append(number)
+
+        pdf_matches = _match_chunk(chunk, pdf_units) if pdf_units else []
+        for candidate in pdf_matches:
+            if candidate["score"] < 0.18:
+                continue
+            page_number = candidate["unit"].get("page_number")
+            if page_number and page_number not in pages and 1 <= page_number <= page_count:
+                pages.append(page_number)
+            if len(pages) >= settings.llm_visual_max_pages_per_chunk:
+                break
+        pages = pages[:settings.llm_visual_max_pages_per_chunk]
+        if not pages:
+            reviews.append({
+                "chunk_id": chunk["chunk_id"], "section_path": chunk.get("section_path", []),
+                "status": "Not reviewed",
+                "reason": "The chunk refers to visual content, but no PDF page could be matched reliably.",
+                "page_numbers": [], "page_refs": [], "visual_observation": "",
+                "chunk_comparison": "", "verdict": "NEEDS_HUMAN_REVIEW", "confidence": None,
+                "severity": None, "improvement": "Check the original PDF page containing this visual.",
+            })
+            continue
+
+        refs = [f"pdf:p{page_number}:visual" for page_number in pages]
+        page_context = []
+        for page_number, ref in zip(pages, refs):
+            excerpts = [unit["text"] for unit in pdf_units if unit.get("page_number") == page_number]
+            page_context.append({
+                "page_number": page_number,
+                "visual_ref": ref,
+                "extracted_page_text": _truncate(" ".join(excerpts[:8]), 1800),
+            })
+        pending.append({
+            "chunk": chunk, "pages": pages, "refs": refs,
+            "page_context": page_context,
+            "reason": (
+                "Chunk includes a visual tag or explicit figure/table/chart reference."
+                if explicit_visual else
+                "Text alignment is weak and the chunk supplies a PDF page reference."
+            ),
+        })
+
+    if not pending:
+        return reviews, {
+            "enabled": settings.llm_visual_review_enabled, "attempted": 0,
+            "succeeded": 0, "failed": 0, "reviewed_chunks": 0,
+            "not_selected_chunks": sum(item["status"] == "Not selected" for item in reviews),
+            "not_reviewed_chunks": sum(item["status"] == "Not reviewed" for item in reviews),
+        }
+
+    try:
+        judge = OpenAICompatibleJudge()
+    except LLMUnavailableError as exc:
+        for item in pending:
+            reviews.append({
+                "chunk_id": item["chunk"]["chunk_id"],
+                "section_path": item["chunk"].get("section_path", []),
+                "status": "Not reviewed", "reason": str(exc),
+                "page_numbers": item["pages"], "page_refs": item["refs"],
+                "visual_observation": "", "chunk_comparison": "",
+                "verdict": "NEEDS_HUMAN_REVIEW", "confidence": None,
+                "severity": None, "improvement": "Check the PDF page manually.",
+            })
+        return reviews, {
+            "enabled": True, "attempted": 0, "succeeded": 0, "failed": 0,
+            "reviewed_chunks": 0,
+            "not_selected_chunks": sum(item["status"] == "Not selected" for item in reviews),
+            "not_reviewed_chunks": sum(item["status"] == "Not reviewed" for item in reviews),
+            "initialization_error": str(exc),
+        }
+
+    def _review(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+        chunk = item["chunk"]
+        try:
+            images = _render_pdf_page_images(pdf_bytes, item["pages"])
+            if len(images) != len(item["pages"]):
+                raise ValueError("Could not render all selected PDF pages.")
+            payload = {
+                "evaluation_id": evaluation_id,
+                "chunk": {
+                    "chunk_id": chunk["chunk_id"],
+                    "section_path": chunk.get("section_path", []),
+                    "text": _truncate(chunk.get("body_content") or chunk.get("content"), 8000),
+                },
+                "pages": item["page_context"],
+                "visual_refs": item["refs"],
+                "task": "Compare visible PDF page content with this chunk. This is advisory and does not change the text based score.",
+            }
+            return item, judge.judge_visual(payload, images), None
+        except Exception as exc:
+            return item, None, str(exc)
+
+    workers = min(settings.llm_max_workers, len(pending))
+    logger.info("llm_visual_reviews_started evaluation_id=%s chunks=%s workers=%s",
+                evaluation_id, len(pending), workers)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="chunk-visual-review") as executor:
+        results = list(executor.map(_review, pending))
+    succeeded = failed = 0
+    for item, result, error in results:
+        chunk = item["chunk"]
+        if error:
+            failed += 1
+            reviews.append({
+                "chunk_id": chunk["chunk_id"], "section_path": chunk.get("section_path", []),
+                "status": "Not reviewed", "reason": error,
+                "page_numbers": item["pages"], "page_refs": item["refs"],
+                "visual_observation": "", "chunk_comparison": "",
+                "verdict": "NEEDS_HUMAN_REVIEW", "confidence": None,
+                "severity": None, "improvement": "Check the cited PDF page manually.",
+            })
+            continue
+
+        assert result is not None
+        verdict = result.get("verdict")
+        if verdict not in {"SUPPORTS", "POTENTIAL_CONFLICT", "NEEDS_HUMAN_REVIEW", "NOT_APPLICABLE"}:
+            verdict = "NEEDS_HUMAN_REVIEW"
+        try:
+            confidence = max(0.0, min(1.0, float(result.get("confidence"))))
+        except (TypeError, ValueError):
+            confidence = None
+        severity = result.get("severity")
+        if verdict != "POTENTIAL_CONFLICT" or severity not in _SEVERITIES:
+            severity = None
+        succeeded += 1
+        reviews.append({
+            "chunk_id": chunk["chunk_id"], "section_path": chunk.get("section_path", []),
+            "status": "Reviewed", "reason": item["reason"],
+            "page_numbers": item["pages"], "page_refs": item["refs"],
+            "visual_observation": _truncate(str(result.get("observation") or "No visual observation returned."), 900),
+            "chunk_comparison": _truncate(str(result.get("chunk_comparison") or "No comparison returned."), 900),
+            "verdict": verdict, "confidence": confidence, "severity": severity,
+            "improvement": _truncate(str(result.get("improvement") or ""), 500),
+        })
+    by_order = {chunk["chunk_id"]: index for index, chunk in enumerate(chunks)}
+    reviews.sort(key=lambda item: by_order.get(item["chunk_id"], len(by_order)))
+    stats = {"enabled": True, "attempted": len(pending), "succeeded": succeeded,
+             "failed": failed, "reviewed_chunks": succeeded,
+             "not_selected_chunks": sum(item["status"] == "Not selected" for item in reviews),
+             "not_reviewed_chunks": sum(item["status"] == "Not reviewed" for item in reviews)}
+    logger.info("llm_visual_reviews_finished evaluation_id=%s attempted=%s succeeded=%s failed=%s",
+                evaluation_id, len(pending), succeeded, failed)
+    return reviews, stats
 
 
 def _build_chunk_reviews(chunks: list[dict[str, Any]], findings: list[dict[str, Any]],
@@ -899,6 +1113,10 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
                              human_review=s05 == "INCONCLUSIVE", scope="document"))
 
     llm_info = _add_llm_findings(chunks, matches, findings, config, evaluation_id)
+    visual_reviews, visual_review_summary = _add_visual_reviews(
+        chunks, bundle.pdf_bytes, evidence["pdf_units"], evidence["page_count"], evaluation_id,
+    )
+    llm_info["visual_review"] = visual_review_summary
     chunk_reviews, review_summary = _build_chunk_reviews(chunks, findings, llm_info)
     for index, finding in enumerate(findings, start=1):
         finding["finding_id"] = f"finding-{index:07d}"
@@ -1033,6 +1251,8 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
         "scorecard": scorecard,
         "review_summary": review_summary,
         "chunk_reviews": chunk_reviews,
+        "visual_reviews": visual_reviews,
+        "visual_review_summary": visual_review_summary,
         "action_plan": build_action_plan(
             gate, findings, missing_units, upstream_issues, llm_info=llm_info,
             overall_score=pass_pct, review_boundary=thresholds["review_required_below"],
@@ -1071,5 +1291,6 @@ def evaluate(bundle: InputBundle, chunks: list[dict[str, Any]], config: dict[str
             "Original PDF evidence is used to identify likely upstream PDF-to-DOCX omissions.",
             "A missing item from DOCX and PDF is not automatically attributed to chunking.",
             "No embedding model was selected; semantic matches are not asserted by this MVP.",
+            "Visual second-review findings are advisory and do not change the five-criterion score.",
         ],
     }

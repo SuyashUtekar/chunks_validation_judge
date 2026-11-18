@@ -303,7 +303,7 @@ if report:
             "- PDF-to-DOCX extraction checks are separate from chunking findings."
         )
 
-    tabs = st.tabs(["Chunk list", "Criterion evidence", "Sections", "Source diagnostics"])
+    tabs = st.tabs(["Chunk list", "Criterion evidence", "Visual review", "Sections", "Source diagnostics"])
     with tabs[0]:
         review_by_id = {item["chunk_id"]: item for item in chunk_reviews}
         chunk_rows = [{
@@ -341,6 +341,32 @@ if report:
           and outcome_labels.get(item.get("outcome")) in selected_outcomes]
         st.dataframe(visible_findings, width="stretch", hide_index=True)
     with tabs[2]:
+        visual_reviews = report.get("visual_reviews", [])
+        visual_summary = report.get("visual_review_summary", {})
+        st.caption(
+            "Targeted multimodal checks compare selected original PDF pages with chunk text. "
+            "They are advisory and do not affect the five-criteria score."
+        )
+        st.write(
+            f"Reviewed: {visual_summary.get('reviewed_chunks', 0)} · "
+            f"Not selected: {visual_summary.get('not_selected_chunks', 0)} · "
+            f"Needs manual review: {visual_summary.get('not_reviewed_chunks', 0)}"
+        )
+        if visual_reviews:
+            st.dataframe([{
+                "Chunk": item.get("chunk_id"),
+                "Section": " > ".join(item.get("section_path") or []) or "No section path",
+                "Status": item.get("status"),
+                "PDF pages": ", ".join(map(str, item.get("page_numbers") or [])),
+                "Visual finding": item.get("visual_observation"),
+                "Comparison": item.get("chunk_comparison"),
+                "Verdict": item.get("verdict"),
+                "Severity": item.get("severity"),
+                "Suggested improvement": item.get("improvement"),
+            } for item in visual_reviews], width="stretch", hide_index=True)
+        else:
+            st.info("No targeted visual-review rows were produced.")
+    with tabs[3]:
         grouped_sections: dict[str, list[dict[str, Any]]] = {}
         for item in chunk_reviews:
             section_name = " > ".join(item.get("section_path") or []) or "No section path"
@@ -354,7 +380,7 @@ if report:
             "Could not evaluate": sum(item["verdict"] == "Could not evaluate" for item in items),
         } for name, items in grouped_sections.items()]
         st.dataframe(section_rows, width="stretch", hide_index=True)
-    with tabs[3]:
+    with tabs[4]:
         coverage = report["coverage"]
         st.caption("These source coverage and PDF-to-DOCX comparisons are diagnostics only; they do not affect the LLM criteria score.")
         st.write(
